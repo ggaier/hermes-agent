@@ -324,8 +324,15 @@ def admission_display(payload):
     return card
 
 
+# A persisted Discord route origin retains auto-thread creation hints while later committed native
+# sources need not carry them. These hints do not identify who/where a message is; excluding them
+# keeps producer wakes comparable without dropping any platform/chat/user/thread/scope routing key.
+_ROUTE_PRESENTATION_HINTS = frozenset({'auto_thread_created', 'auto_thread_initial_name'})
+
+
 def _route_identity(source):
-    return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
+    return {key: value for key, value in source.to_dict().items()
+            if key != 'message_id' and key not in _ROUTE_PRESENTATION_HINTS}
 
 
 def committed_route_envelope(authority, entry):
