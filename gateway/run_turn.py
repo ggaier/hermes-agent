@@ -2237,6 +2237,14 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
         _status_thread_metadata = turn_ctx._status_thread_metadata
         _heartbeat_msg_id: Optional[str] = None
+        # Milestone pings: a NEW message every _ping_interval seconds. The bubble
+        # above is edited in place, and neither Discord nor Telegram pushes a
+        # notification for an edit -- so from outside the chat a long run reads as
+        # silent (card idXGRRa4 asked for download-style progress). 0 = bubble only.
+        _ping_interval = _float_env("HERMES_AGENT_PROGRESS_PING_INTERVAL", 0)
+        if _ping_interval > 0 and _ping_interval < _NOTIFY_INTERVAL:
+            _ping_interval = _NOTIFY_INTERVAL  # never ping faster than the bubble refreshes
+        _next_ping_at = (_notify_start + _ping_interval) if _ping_interval > 0 else None
         # A send/edit that never reached the chat is logged at WARNING, once per
         # run: a heartbeat that goes silent is otherwise invisible in the logs
         # (the 2026-10-22 Discord reconnect left a 34-minute run with no
@@ -2287,6 +2295,28 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 if _long_running_mode == "generic"
                 else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
             )
+            # Milestone ping: its own message so the platform actually notifies.
+            # Sent through the same late-bound adapter path as the bubble, and
+            # never allowed to break the segment (best-effort, like the bubble).
+            if _next_ping_at is not None and time.time() >= _next_ping_at:
+                _next_ping_at = time.time() + _ping_interval
+                if _elapsed_mins >= 1:
+                    _ping_adapter = _resolve_adapter()
+                    if _ping_adapter is not None:
+                        try:
+                            _ping_res = await _ping_adapter.send(
+                                source.chat_id,
+                                t("gateway.progress.progress_ping",
+                                  minutes=_elapsed_mins, detail=_status_detail),
+                                metadata=_interim_metadata(_non_conversational_metadata(
+                                    _status_thread_metadata, platform=source.platform)),
+                            )
+                            if getattr(_ping_res, "success", False) and turn_ctx._cleanup_progress:
+                                _ping_mid = getattr(_ping_res, "message_id", None)
+                                if _ping_mid:
+                                    turn_ctx._cleanup_msg_ids.append(str(_ping_mid))
+                        except Exception as _pe:
+                            logger.debug("Progress ping failed: %s", _pe)
             try:
                 # Resolve per tick (see _resolve_adapter): after a reconnect the
                 # old adapter's session is closed and cannot deliver anything.

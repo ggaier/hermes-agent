@@ -232,6 +232,13 @@ DEFAULT_CONFIG = {
         # "Still working" status interval (seconds); 0 = off. Lower = faster feedback, more noise;
         # 180 catches spinning weak-model runs before users /restart.
         "gateway_notify_interval": 180,
+        # Milestone progress pings (seconds); 0 = off. A SEPARATE message (not an edit of the
+        # heartbeat bubble) every N seconds — the heartbeat edits one bubble in place, and an edit
+        # pushes no notification on Discord/Telegram, so a long run looks silent from outside the
+        # chat even while its bubble is updating. 0 = only the edited bubble. Must be a multiple of,
+        # or larger than, gateway_notify_interval to avoid pinging faster than the bubble refreshes.
+        # See the 2026-10-22 "no progress at all" incident.
+        "gateway_progress_ping_interval": 0,
         # Session stall watchdog (seconds): RECOVERY notifier for an in-process AIAgent with an
         # adapter-queued follow-up while its activity clock is stale — NOT a general stall detector
         # (ignores startup restore, build sentinels, leases, debounce, other processes; scan cadence
