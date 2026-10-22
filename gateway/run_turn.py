@@ -2211,6 +2211,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
         turn_ctx._status_adapter = self._delivery_adapter_for(source)
+        # Progress must follow a reconnect: the adapter captured above belongs to
+        # the transport that was live when the turn started (see
+        # TurnContext.current_status_adapter).
+        turn_ctx._resolve_status_adapter = lambda: self._delivery_adapter_for(source)
         turn_ctx._status_chat_id = source.chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
         return _status_thread_metadata
@@ -2232,10 +2236,29 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             return
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
         _status_thread_metadata = turn_ctx._status_thread_metadata
-        _notify_adapter = self._delivery_adapter_for(source)
-        if not _notify_adapter:
-            return
         _heartbeat_msg_id: Optional[str] = None
+        # A send/edit that never reached the chat is logged at WARNING, once per
+        # run: a heartbeat that goes silent is otherwise invisible in the logs
+        # (the 2026-10-22 Discord reconnect left a 34-minute run with no
+        # progress and no diagnostic above debug level).
+        _unreachable_logged = False
+
+        def _resolve_adapter():
+            """Re-resolve on every tick: a reconnected platform replaces the adapter.
+
+            The adapter captured at turn start belongs to the transport that was
+            live then. After a websocket drop the gateway installs a NEW adapter
+            and closes the old one's session, so every later ``edit_message`` on
+            the captured instance raises ``RuntimeError("Session is closed")`` —
+            and the old fallback re-sent through that same dead adapter, which
+            silenced the rest of the run (#12029 sibling).
+            """
+            try:
+                return self._delivery_adapter_for(source)
+            except Exception as exc:  # resolution must never kill the heartbeat
+                logger.debug("Heartbeat adapter resolution failed: %s", exc)
+                return None
+
         while True:
             await asyncio.sleep(_NOTIFY_INTERVAL)
             if not self._should_emit_long_running_notification(
@@ -2265,13 +2288,20 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
             )
             try:
+                # Resolve per tick (see _resolve_adapter): after a reconnect the
+                # old adapter's session is closed and cannot deliver anything.
+                _notify_adapter = _resolve_adapter()
                 _notify_res = None
-                if _heartbeat_msg_id:
+                if _heartbeat_msg_id and _notify_adapter is not None:
                     try:
                         _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
                     except Exception as _ee:
                         logger.debug("Heartbeat edit failed: %s", _ee)
                         _notify_res = None
+                if getattr(_notify_res, "success", False):
+                    # Delivered (edited in place): a later failure is a NEW outage
+                    # and must warn again rather than stay silent behind the first one.
+                    _unreachable_logged = False
                 if not (_notify_res and getattr(_notify_res, "success", False)):
                     # The edit above awaited; a drain/restart notice may have gone out meanwhile, and
                     # a fresh "Working" bubble after it reads as a contradiction (#10990).
@@ -2279,7 +2309,13 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                         session_key, agent_holder[0], _executor_task_holder[0]
                     ):
                         break
-                    _notify_res = await _notify_adapter.send(
+                    # The edit failed, possibly because THAT adapter's transport is
+                    # gone. Re-resolve before sending so the fallback bubble can use
+                    # a freshly installed adapter instead of the same dead one.
+                    _send_adapter = _resolve_adapter() or _notify_adapter
+                    if _send_adapter is None:
+                        raise RuntimeError("no delivery adapter is registered for this session")
+                    _notify_res = await _send_adapter.send(
                         source.chat_id, _heartbeat_text,
                         metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
                     )
@@ -2287,8 +2323,27 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                         _heartbeat_msg_id = str(_notify_res.message_id)
                         if turn_ctx._cleanup_progress:
                             turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                        # Delivered: a later failure is a NEW outage and must warn again.
+                        _unreachable_logged = False
+                    elif not _unreachable_logged:
+                        _unreachable_logged = True
+                        logger.warning(
+                            "Heartbeat could not reach %s chat %s; segment continues "
+                            "without progress updates (adapter=%s)",
+                            getattr(source, "platform", "?"), getattr(source, "chat_id", "?"),
+                            type(_send_adapter).__name__,
+                        )
             except Exception as _ne:
-                logger.debug("Long-running notification error: %s", _ne)
+                # Delivering progress is best-effort, but a run that goes silent is
+                # a user-visible failure: say so once at WARNING, keep the segment.
+                if not _unreachable_logged:
+                    _unreachable_logged = True
+                    logger.warning(
+                        "Heartbeat delivery failed for %s chat %s: %s; segment continues",
+                        getattr(source, "platform", "?"), getattr(source, "chat_id", "?"), _ne,
+                    )
+                else:
+                    logger.debug("Long-running notification error: %s", _ne)
 
     async def _run_agent_inner(
         self, message: str, context_prompt: str, history: list[dict[str, Any]],

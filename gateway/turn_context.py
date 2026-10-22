@@ -88,6 +88,10 @@ class TurnContext:
     _loop_for_step: Any = None
     _hooks_ref: Any = None
     _status_adapter: Any = None
+    # Late-binding resolver for ``_status_adapter`` (see ``current_status_adapter``).
+    # The field alone freezes the adapter the turn started on; after a platform
+    # reconnect that instance's transport is closed and every progress send fails.
+    _resolve_status_adapter: Optional[Callable] = None
     _status_chat_id: Any = None
     _status_thread_metadata: Optional[dict] = None
     # bound TurnRunner callbacks read via ctx
@@ -104,3 +108,24 @@ class TurnContext:
     _native_slack_task_cards: bool = False
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
+
+    def current_status_adapter(self):
+        """The adapter that can deliver progress RIGHT NOW.
+
+        Progress must not be pinned to the adapter the turn started on: a
+        platform reconnect installs a NEW adapter object (and closes the old
+        one's transport), so a captured instance raises ``Session is closed`` for
+        every later send. That is how a 57-minute Discord run went silent at its
+        24th minute with 162 API calls still to come (2026-10-22).
+
+        Falls back to the captured adapter when no resolver is wired (hand-built
+        contexts in tests) or when resolution raises — a resolver failure must
+        degrade to "try the old instance", never to silently no progress.
+        """
+        resolver = self._resolve_status_adapter
+        if resolver is None:
+            return self._status_adapter
+        try:
+            return resolver() or self._status_adapter
+        except Exception:
+            return self._status_adapter

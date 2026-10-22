@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 
 from agent.i18n import t
 from gateway.platforms.base_exec_approval import approval_timeout_seconds, format_approval_timed_out_notice
+from gateway.run_turn_progress import current_status_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ def register_timeout_notice(
 async def _post_timeout_notice(ctx, command: str, card_message_id: Optional[str], timeout_s: int) -> None:
     from gateway.run import _interim_metadata
 
-    adapter = ctx._status_adapter
+    adapter = current_status_adapter(ctx)
     notice = format_approval_timed_out_notice(timeout_s)
     metadata = _interim_metadata(ctx._status_thread_metadata)
     try:

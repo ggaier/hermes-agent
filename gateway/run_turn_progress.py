@@ -19,8 +19,24 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.turn_context import TurnContext
+
+
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
+
+def current_status_adapter(ctx):
+    """The adapter that can deliver progress for *ctx* right now.
+
+    Thin module-level seam so both real ``TurnContext`` instances and the bare
+    ``SimpleNamespace`` contexts in tests resolve the same way. Delegates to
+    ``TurnContext.current_status_adapter`` when present, else reads the captured
+    field (a reconnect leaves that instance's transport closed, which is exactly
+    what the seam exists to avoid — see the method's docstring).
+    """
+    resolver = getattr(ctx, "current_status_adapter", None)
+    if callable(resolver):
+        return resolver()
+    return getattr(ctx, "_status_adapter", None)
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -917,11 +933,11 @@ class GatewayTurnProgressMixin:
 
     def _status_live(self) -> bool:
         """Status adapter present and this run is still the current generation."""
-        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
+        return bool(current_status_adapter(self._ctx)) and self._ctx._run_still_current()
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
-        self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
+        self._schedule(current_status_adapter(ctx).send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _attach_session_title_callback(self, agent, ctx) -> None:
         """Wire the platform thread-rename lane onto the agent as `_on_session_title`.
@@ -986,7 +1002,7 @@ class GatewayTurnProgressMixin:
                                                           "text": prepared})
                 return
             fut = self._schedule(
-                _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+                _send_or_update_status_coro(current_status_adapter(ctx), ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
                 f"status_callback ({event_type}) scheduling error",
             )
             if fut is not None and ctx._cleanup_progress:

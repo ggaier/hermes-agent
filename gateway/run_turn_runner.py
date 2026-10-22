@@ -111,7 +111,7 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-from gateway.run_turn_progress import GatewayTurnProgressMixin
+from gateway.run_turn_progress import GatewayTurnProgressMixin, current_status_adapter
 from gateway.session_execution import GatewaySessionAgentMixin
 
 
@@ -311,7 +311,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 return
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
-            elif not already_streamed and ctx._status_adapter and str(text or "").strip():
+            elif not already_streamed and current_status_adapter(ctx) and str(text or "").strip():
                 self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
 
         return stream_consumer, stream_delta_cb, interim_assistant_cb, want_interim_messages
@@ -458,11 +458,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         agent.background_review_callback, bg_release = self._make_bg_review_callbacks()
         # Register the release hook on the adapter so base.py's finally block fires it after the
         # main response is delivered.
-        if ctx._status_adapter and ctx.session_key:
-            if getattr(type(ctx._status_adapter), "register_post_delivery_callback", None) is not None:
-                ctx._status_adapter.register_post_delivery_callback(ctx.session_key, bg_release, generation=ctx.run_generation)
+        _pdc_adapter = current_status_adapter(ctx)
+        if _pdc_adapter and ctx.session_key:
+            if getattr(type(_pdc_adapter), "register_post_delivery_callback", None) is not None:
+                _pdc_adapter.register_post_delivery_callback(ctx.session_key, bg_release, generation=ctx.run_generation)
             else:
-                pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
+                pdc = getattr(_pdc_adapter, "_post_delivery_callbacks", None)
                 if pdc is not None:
                     pdc[ctx.session_key] = bg_release
         # display.memory_notifications: off | on (generic "💾 Memory updated", default) | verbose.
@@ -528,7 +529,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             return False
 
     async def _send_shared_clarify(self, entry, **kwargs):
-        result = await self._ctx._status_adapter.send_clarify(**kwargs)
+        result = await current_status_adapter(self._ctx).send_clarify(**kwargs)
         if self._approval_owner is not None and result.success:
             authority, session_id, generation = self._approval_owner
             from gateway import local_viewer_events
@@ -584,7 +585,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from tools import clarify_gateway as clarify_mod
         import uuid
         ctx = self._ctx
-        if not ctx._status_adapter:
+        if not current_status_adapter(ctx):
             # Nothing can render the question: say so, or the batch's blank answers read as
             # user inactivity (#112684).
             return UNDELIVERED_NO_SURFACE, False
@@ -598,7 +599,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
 
         def _text_fallback():
             """Schedule the plain-text prompt when the native card cannot render; None = no such path."""
-            coro = text_fallback_coro(ctx._status_adapter, **send_kwargs)
+            coro = text_fallback_coro(current_status_adapter(ctx), **send_kwargs)
             return None if coro is None else self._schedule(coro, "Clarify text fallback failed to schedule")
         entry = clarify_mod.register(
             clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
@@ -610,7 +611,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Pause typing: a "thinking..." status must not obscure the prompt or block an "Other" reply
         # on platforms that disable input while typing (Slack Assistant).
         with suppress(Exception):
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            current_status_adapter(ctx).pause_typing_for_chat(ctx._status_chat_id)
         # Ordering barrier: flush buffered assistant prose BEFORE the poll, which goes out on a
         # separate agent-thread-blocking path and would otherwise render ABOVE its own explanation.
         # Best-effort + short timeout so the agent thread never hangs if the consumer isn't running.
@@ -639,10 +640,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         if not answered:
             # No answer arrived (timeout, /new, run end): retire the native card so it stops
             # looking answerable. Adapters without a persistent card have no such method.
-            retire = getattr(type(ctx._status_adapter), "retire_clarify_card", None)
+            _retire_adapter = current_status_adapter(ctx)
+            retire = getattr(type(_retire_adapter), "retire_clarify_card", None)
             if callable(retire):
                 self._schedule(
-                    retire(ctx._status_adapter, clarify_id, _clarify_expired_notice()),
+                    retire(_retire_adapter, clarify_id, _clarify_expired_notice()),
                     "Clarify card retire failed to schedule")
         elif rearm:
             # Reopen typing IMMEDIATELY, not on the LLM's first post-answer token (native streaming
@@ -655,7 +657,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 except Exception:
                     logger.debug("request_reopen_seed after clarify answer failed", exc_info=True)
             try:
-                ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id)
+                current_status_adapter(ctx).resume_typing_for_chat(ctx._status_chat_id)
             except Exception:
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
         return response, answered
@@ -677,7 +679,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         ctx = self._ctx
-        adapter = ctx._status_adapter
+        adapter = current_status_adapter(ctx)
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
