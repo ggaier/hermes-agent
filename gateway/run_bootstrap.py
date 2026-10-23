@@ -254,7 +254,7 @@ def _start_gateway_claim_pid_file(force: bool = False) -> bool:
 
 async def _start_gateway_start_control_socket(runner):
     """Start the gateway control socket (identify/status/pause-for-update); None when unavailable."""
-    from gateway.run import (asyncio, logger, os, threading)
+    from gateway.run import (asyncio, logger, os, threading, get_hermes_home)
     import atexit
     import concurrent.futures
     _control_server = None
@@ -344,6 +344,14 @@ async def _start_gateway_start_control_socket(runner):
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
                            "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+        from gateway.native_start import control_handlers as _native_start_handlers
+        # Trusted local peer grants a scoped native-start capability and starts one
+        # native Discord-thread session through the normal admission/queue/turn path.
+        _control_server.private_handlers.update(
+            _native_start_handlers(
+                runner,
+                Path(getattr(runner, "hermes_home", None) or get_hermes_home()),
+                _main_loop))
         _control_server.ticket_store = runner.session_ticket_store
         if not await _control_server.start():
             _control_server = None

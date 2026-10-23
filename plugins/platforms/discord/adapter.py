@@ -5613,6 +5613,38 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             )
             return None
 
+    async def add_thread_member(self, thread_id: str, user_id: str) -> bool:
+        """Add one user to a thread; ``False`` when the thread cannot be resolved or added.
+
+        Private threads (``type=12``) are invisible to a user until they are explicitly
+        added, so a native start must not treat a silent skip as success. Only the REST
+        call (``Thread.add_user``) is external; resolution goes through ``_resolve_channel``.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return False
+        try:
+            channel = await self._resolve_channel(thread_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Thread member: cannot resolve thread %s: %s", self.name, thread_id, exc,
+            )
+            return False
+        add_user = getattr(channel, "add_user", None)
+        if not callable(add_user):
+            logger.warning(
+                "[%s] Thread member: %s is not a thread (no add_user)", self.name, thread_id,
+            )
+            return False
+        try:
+            await add_user(discord.Object(id=int(user_id)))
+        except Exception as exc:
+            logger.warning(
+                "[%s] Thread member: cannot add %s to thread %s: %s",
+                self.name, user_id, thread_id, exc,
+            )
+            return False
+        return True
+
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""
     ) -> str:
