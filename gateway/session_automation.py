@@ -347,6 +347,53 @@ def committed_route_envelope(authority, entry):
     return envelope if envelope is not None and 'provenance' in envelope else None
 
 
+def committed_operator_admission(authority, entry):
+    """The route's committed operator admission authored by native-start, or None."""
+    from hermes_state_runtime import list_session_admissions
+    prior = list_session_admissions(authority.db, session_id=authority.logical_owner(entry.session_id),
+                                    pending_only=False)
+    for r in reversed(prior):
+        payload = r.get('payload') or {}
+        op = payload.get('local_operator_v1')
+        if r.get('principal_id') == 'native-start' or (isinstance(op, dict) and op.get('principal_id') == 'native-start'):
+            return r
+    return None
+
+
+def _route_matches(runner, entry, restored_source, event_source):
+    """Compare route identity (session-key derivation proof + non-null routing key equality),
+    not strict dict equality."""
+    r1 = _route_identity(restored_source)
+    r2 = _route_identity(event_source)
+    if _ROUTE_PRESENTATION_HINTS & (set(r1) | set(r2)):
+        return False
+
+    if runner.session_store._generate_session_key(restored_source) != entry.session_key:
+        return False
+    if runner.session_store._generate_session_key(event_source) != entry.session_key:
+        return False
+
+    routing_keys = ('platform', 'chat_id', 'chat_type', 'thread_id', 'parent_chat_id', 'user_id')
+    for key in routing_keys:
+        v1 = getattr(restored_source, key, None)
+        v2 = getattr(event_source, key, None)
+        if v1 is not None and v2 is not None and v1 != v2:
+            return False
+
+    s1 = getattr(restored_source, 'scope_id', None) or getattr(restored_source, 'guild_id', None)
+    s2 = getattr(event_source, 'scope_id', None) or getattr(event_source, 'guild_id', None)
+    if s1 is not None and s2 is not None and s1 != s2:
+        return False
+
+    for key in ('user_name', 'profile', 'prospective_thread_id'):
+        v1 = getattr(restored_source, key, None)
+        v2 = getattr(event_source, key, None)
+        if v1 is not None and v2 is not None and v1 != v2:
+            return False
+
+    return True
+
+
 def snapshot_automation(authority, adapter, event, identity):
     runner = authority.runner
     if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
@@ -363,27 +410,46 @@ def snapshot_automation(authority, adapter, event, identity):
     owner = authority.logical_owner(entry.session_id)
     envelope = committed_route_envelope(authority, entry)
     if envelope is None:
-        raise RuntimeStoreError('not_found')
-    # Persisted origins deliberately omit relay trust. Borrow only an exact
-    # committed source's private proof, revalidated against the live connector.
-    # Recheck only the source/provenance: a completed input's retained media is already released.
-    restored = restore_native({'text': event.text, 'native_text_v1': {
-        key: value for key, value in envelope.items() if key != 'media'}}, runner)
-    # Synthetic wakes clear ``message_id`` (#52694, #123097) while the committed human source keeps
-    # it, so compare the routing/provenance identity, never the platform reply anchor.
-    if (_route_identity(restored.source) != _route_identity(event.source)
-            or runner._adapter_for_source(restored.source) is not adapter):
-        raise RuntimeStoreError('admission_conflict')
-    provenance = deepcopy(envelope['provenance'])
-    source = deepcopy(envelope['source'])
-    # Never anchor the wake to the stale human message; ``to_dict`` already omits a null anchor.
-    source.pop('message_id', None)
-    # Producer timestamps and platform reply IDs change on retry. Neither belongs
-    # in the identity/fingerprint of the same immutable completion.
-    envelope = {'source': source, 'route': entry.session_key,
-        'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
-        'event': {'message_id': identity}, 'provenance': provenance,
-        'automation': {'identity': identity, 'owner': owner}}
+        op_admission = committed_operator_admission(authority, entry)
+        if op_admission is None:
+            raise RuntimeStoreError('not_found')
+        from gateway.session_ingress_context import resolve_operator_provenance
+        bound_adapter, provenance = resolve_operator_provenance(
+            runner, event.source, getattr(event.source, 'profile', None)
+        )
+        if runner._adapter_for_source(event.source) is not adapter or bound_adapter is not adapter:
+            raise RuntimeStoreError('admission_conflict')
+        source = deepcopy(event.source.to_dict())
+        source.pop('message_id', None)
+        envelope = {
+            'source': source,
+            'route': entry.session_key,
+            'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
+            'event': {'message_id': identity},
+            'provenance': provenance,
+            'automation': {'identity': identity, 'owner': owner},
+        }
+    else:
+        # Persisted origins deliberately omit relay trust. Borrow only an exact
+        # committed source's private proof, revalidated against the live connector.
+        # Recheck only the source/provenance: a completed input's retained media is already released.
+        restored = restore_native({'text': event.text, 'native_text_v1': {
+            key: value for key, value in envelope.items() if key != 'media'}}, runner)
+        # Synthetic wakes clear ``message_id`` (#52694, #123097) while the committed human source keeps
+        # it, so compare the routing/provenance identity, never the platform reply anchor.
+        if (not _route_matches(runner, entry, restored.source, event.source)
+                or runner._adapter_for_source(restored.source) is not adapter):
+            raise RuntimeStoreError('admission_conflict')
+        provenance = deepcopy(envelope['provenance'])
+        source = deepcopy(envelope['source'])
+        # Never anchor the wake to the stale human message; ``to_dict`` already omits a null anchor.
+        source.pop('message_id', None)
+        # Producer timestamps and platform reply IDs change on retry. Neither belongs
+        # in the identity/fingerprint of the same immutable completion.
+        envelope = {'source': source, 'route': entry.session_key,
+            'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
+            'event': {'message_id': identity}, 'provenance': provenance,
+            'automation': {'identity': identity, 'owner': owner}}
     envelope['automation'].update(notification)
     if getattr(event, '_heartbeat_session_id', None):
         envelope['automation']['heartbeat'] = event._heartbeat_session_id

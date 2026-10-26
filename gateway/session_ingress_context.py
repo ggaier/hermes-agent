@@ -179,6 +179,15 @@ def _binding(runner, source, profile):
     return adapter, home, runtime_home, provenance
 
 
+def resolve_operator_provenance(runner, source, profile=None):
+    """Obtain (adapter, provenance) from the live adapter binding without a callback context.
+    Used for producer completion admission on routes initiated by native-start."""
+    if profile == 'default':
+        profile = None
+    adapter, _home, _runtime_home, provenance = _binding(runner, source, profile)
+    return adapter, provenance
+
+
 def capture_provenance(runner, event):
     context = _callback.get()
     if context is None or context[0] is not runner or context[1] is not event:
