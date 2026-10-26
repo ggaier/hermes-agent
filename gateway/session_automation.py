@@ -329,6 +329,11 @@ def admission_display(payload):
 # keeps producer wakes comparable without dropping any platform/chat/user/thread/scope routing key.
 _ROUTE_PRESENTATION_HINTS = frozenset({'auto_thread_created', 'auto_thread_initial_name'})
 
+# ``gateway/native_start.py`` fabricates this display name when the control-socket grant carries
+# no ``user_name`` (the normal case: the grant identifies the operator by id). It therefore means
+# "unknown", never a distinct identity, and must not make a completion refuse its own route.
+_NATIVE_START_PLACEHOLDER_USER_NAME = 'operator'
+
 
 def _route_identity(source):
     return {key: value for key, value in source.to_dict().items()
@@ -362,15 +367,16 @@ def committed_operator_admission(authority, entry):
 
 def _route_matches(runner, entry, restored_source, event_source):
     """Route identity: the session-key derivation (the same proof ``check_automation_route``
-    uses) plus equality of routing keys that are already present on BOTH sides.
+    uses) plus equality of routing keys present on BOTH sides.
 
-    Compared: platform, chat_id, chat_type, thread_id, parent_chat_id, user_id, scope.
-    Deliberately NOT compared: ``user_name`` — a display label, not a routing key. The
-    native-start bridge constructs the thread source with a placeholder (``"operator"``)
-    when the grant carries no display name, so the persisted origin legitimately differs
-    from the human envelope's real name while addressing the exact same chat and user.
-    Comparing it refused every completion on those routes (live 2026-10-26).
-    ``message_id``/auto-thread hints never reach here: ``_route_identity`` strips them.
+    ``user_name`` is compared (a different display name is real source drift and must still be
+    refused, ``tests/gateway/test_automation_notification_category.py::…refuses_other_source_drift``),
+    EXCEPT for ``_NATIVE_START_PLACEHOLDER_USER_NAME``: ``gateway/native_start.py`` used to
+    fabricate that literal when the control-socket grant carried no display name, so it is a
+    "unknown", not an identity. It must not refuse completions on those routes — which is exactly
+    what happened in production after the 2026-10-26 deploy (every completion refused with
+    ``admission_conflict``, looping once per retry per session). New starts no longer fabricate it;
+    this exception keeps the already-persisted origins recoverable.
     """
     if runner.session_store._generate_session_key(restored_source) != entry.session_key:
         return False
@@ -388,6 +394,14 @@ def _route_matches(runner, entry, restored_source, event_source):
     s2 = getattr(event_source, 'scope_id', None) or getattr(event_source, 'guild_id', None)
     if s1 is not None and s2 is not None and s1 != s2:
         return False
+
+    for key in ('user_name', 'profile', 'prospective_thread_id'):
+        v1 = getattr(restored_source, key, None)
+        v2 = getattr(event_source, key, None)
+        if key == 'user_name' and _NATIVE_START_PLACEHOLDER_USER_NAME in (v1, v2):
+            continue  # an unknown display name, not a distinct identity
+        if v1 is not None and v2 is not None and v1 != v2:
+            return False
 
     return True
 

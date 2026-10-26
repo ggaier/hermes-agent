@@ -429,7 +429,11 @@ async def start_native_thread(runner, params: dict, peer_subject: Optional[str])
 
         source = SessionSource(
             platform=Platform.DISCORD, chat_id=thread_id, chat_type="thread",
-            user_id=user_id, user_name=str(operator.get("user_name") or "operator"),
+            # Never fabricate a display name: an invented one ("operator") is not this user's
+            # identity, and a stored origin that carries it cannot be compared against the real
+            # envelope later (producer wakes refuse on source drift). The grant identifies the
+            # operator by id; the display name is filled in by the operator's own first message.
+            user_id=user_id, user_name=(str(operator["user_name"]) if operator.get("user_name") else None),
             thread_id=thread_id, parent_chat_id=parent,
         )
         ref = authority.register(source)
