@@ -361,13 +361,17 @@ def committed_operator_admission(authority, entry):
 
 
 def _route_matches(runner, entry, restored_source, event_source):
-    """Compare route identity (session-key derivation proof + non-null routing key equality),
-    not strict dict equality."""
-    r1 = _route_identity(restored_source)
-    r2 = _route_identity(event_source)
-    if _ROUTE_PRESENTATION_HINTS & (set(r1) | set(r2)):
-        return False
+    """Route identity: the session-key derivation (the same proof ``check_automation_route``
+    uses) plus equality of routing keys that are already present on BOTH sides.
 
+    Compared: platform, chat_id, chat_type, thread_id, parent_chat_id, user_id, scope.
+    Deliberately NOT compared: ``user_name`` — a display label, not a routing key. The
+    native-start bridge constructs the thread source with a placeholder (``"operator"``)
+    when the grant carries no display name, so the persisted origin legitimately differs
+    from the human envelope's real name while addressing the exact same chat and user.
+    Comparing it refused every completion on those routes (live 2026-10-26).
+    ``message_id``/auto-thread hints never reach here: ``_route_identity`` strips them.
+    """
     if runner.session_store._generate_session_key(restored_source) != entry.session_key:
         return False
     if runner.session_store._generate_session_key(event_source) != entry.session_key:
@@ -384,12 +388,6 @@ def _route_matches(runner, entry, restored_source, event_source):
     s2 = getattr(event_source, 'scope_id', None) or getattr(event_source, 'guild_id', None)
     if s1 is not None and s2 is not None and s1 != s2:
         return False
-
-    for key in ('user_name', 'profile', 'prospective_thread_id'):
-        v1 = getattr(restored_source, key, None)
-        v2 = getattr(event_source, key, None)
-        if v1 is not None and v2 is not None and v1 != v2:
-            return False
 
     return True
 

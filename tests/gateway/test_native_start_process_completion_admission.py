@@ -276,6 +276,131 @@ async def test_process_completion_must_admit_despite_discord_channel_metadata_en
 
 
 @pytest.mark.asyncio
+async def test_persisted_origin_placeholder_user_name_must_not_refuse_completion(gateway_fixture):
+    """Regression (live 2026-10-26 post-deploy): native_start builds the thread's source with
+
+    ``user_name=str(operator.get("user_name") or "operator")`` — the bridge grant carries the
+    operator id but often no display name, so the PERSISTED origin stores the literal
+    placeholder ``"operator"`` while the human message commits the real display name
+    (``"ggaier"``). ``user_name`` is a presentation label, not a routing key: a completion must
+    still be admitted. Production logs proved this exact difference refused every completion
+    with ``admission_conflict`` after the restart, looping once per retry per session.
+    """
+    gf = gateway_fixture
+
+    await gf.authority.submit(
+        Principal("native-start", "default", frozenset({"session:submit"}), "control-socket"),
+        Submission("card24-grant-1", gf.ref, {"text": "brief"}, "queue"),
+    )
+
+    human_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=THREAD_ID,
+        chat_type="thread",
+        user_id=USER_ID,
+        user_name=USER_NAME,
+        thread_id=THREAD_ID,
+        parent_chat_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        scope_id=GUILD_ID,
+        chat_name="AI Bots / #tele-mac / placeholder name",
+        is_bot=False,
+    )
+    human_source_dict = human_source.to_dict()
+    human_source_dict["is_bot"] = False
+    admit_session_input(
+        gf.db,
+        epoch=gf.authority.epoch,
+        principal_id="messaging:[null,\"discord\",...]",
+        session_id=gf.ref.session_id,
+        request_id="1564116193932222497",
+        payload={
+            "text": "payload built with the placeholder user_name the persisted origin carries",
+            "native_text_v1": {
+                "source": human_source_dict,
+                "provenance": {
+                    "connector": "adapter:discord:harness",
+                    "platform": "discord",
+                    "runtime_home": str(gf.home),
+                    "transport_home": str(gf.home),
+                },
+                "route": ROUTE,
+                "timestamp": "2026-10-26T10:11:03.000000+00:00",
+                "event": {"message_id": "1564116193932222497"},
+            },
+        },
+        intent="queue",
+    )
+
+    # The stored origin the bridge actually wrote: same route, placeholder display name.
+    entry = gf.store.lookup_by_session_key(ROUTE)
+    from gateway.session_identity import replace_source
+    entry.origin = replace_source(gf.origin, user_name="operator")
+
+    evt = {
+        "type": "completion",
+        "session_id": "proc_placeholder_name",
+        "started_at": 1792982910.0,
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "session_key": ROUTE,
+        "parent_session_id": gf.ref.session_id,
+        "platform": "discord",
+        "chat_id": THREAD_ID,
+        "thread_id": THREAD_ID,
+        "chat_type": "thread",
+        "user_id": USER_ID,
+        "user_name": "operator",
+    }
+    delivered = await gf.runner._inject_watch_notification(
+        "[IMPORTANT: Background process proc_placeholder_name completed]", evt, raise_not_accepted=True,
+    )
+    assert delivered is True, "A placeholder display name must not refuse the completion"
+
+
+@pytest.mark.asyncio
+async def test_conflicting_user_id_still_refuses_completion(gateway_fixture):
+    """Negative control for the identity relaxation: ``user_name`` is presentation, ``user_id``
+    is not. A source whose real user id differs must still be refused."""
+    gf = gateway_fixture
+
+    await gf.authority.submit(
+        Principal("native-start", "default", frozenset({"session:submit"}), "control-socket"),
+        Submission("card24-grant-1", gf.ref, {"text": "brief"}, "queue"),
+    )
+    other_source = SessionSource(
+        platform=Platform.DISCORD, chat_id=THREAD_ID, chat_type="thread",
+        user_id="999000111", user_name="someone-else", thread_id=THREAD_ID,
+        parent_chat_id=CHANNEL_ID, guild_id=GUILD_ID, scope_id=GUILD_ID,
+    )
+    other_dict = other_source.to_dict()
+    other_dict["is_bot"] = False
+    admit_session_input(
+        gf.db, epoch=gf.authority.epoch,
+        principal_id="messaging:[null,\"discord\",...]", session_id=gf.ref.session_id,
+        request_id="human-other-user",
+        payload={"text": "hi", "native_text_v1": {
+            "source": other_dict,
+            "provenance": {"connector": "adapter:discord:harness", "platform": "discord",
+                           "runtime_home": str(gf.home), "transport_home": str(gf.home)},
+            "route": ROUTE, "timestamp": "2026-10-26T10:11:03.000000+00:00",
+            "event": {"message_id": "human-other-user"}}},
+        intent="queue",
+    )
+    evt = {
+        "type": "completion", "session_id": "proc_foreign_user", "started_at": 1792983910.0,
+        "exit_code": 0, "completion_reason": "exited", "session_key": ROUTE,
+        "parent_session_id": gf.ref.session_id, "platform": "discord",
+        "chat_id": THREAD_ID, "thread_id": THREAD_ID, "chat_type": "thread",
+        "user_id": USER_ID, "user_name": USER_NAME,
+    }
+    with pytest.raises(WakeNotAccepted):
+        await gf.runner._inject_watch_notification(
+            "[IMPORTANT: Background process proc_foreign_user completed]", evt, raise_not_accepted=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_negative_controls_foreign_owner_and_adapter_remain_refused(gateway_fixture):
     """Negative controls: Genuine security and ownership boundaries must remain enforced.
     1. A completion event claiming a foreign parent_session_id must be refused (admission_conflict).
