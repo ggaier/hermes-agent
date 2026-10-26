@@ -366,41 +366,65 @@ def committed_operator_admission(authority, entry):
 
 
 def _route_matches(runner, entry, restored_source, event_source):
-    """Route identity: the session-key derivation (the same proof ``check_automation_route``
-    uses) plus equality of routing keys present on BOTH sides.
+    """Route identity: the session-key derivation plus equality of routing identity.
 
-    ``user_name`` is compared (a different display name is real source drift and must still be
-    refused, ``tests/gateway/test_automation_notification_category.py::…refuses_other_source_drift``),
-    EXCEPT for ``_NATIVE_START_PLACEHOLDER_USER_NAME``: ``gateway/native_start.py`` used to
-    fabricate that literal when the control-socket grant carried no display name, so it is a
-    "unknown", not an identity. It must not refuse completions on those routes — which is exactly
-    what happened in production after the 2026-10-26 deploy (every completion refused with
-    ``admission_conflict``, looping once per retry per session). New starts no longer fabricate it;
-    this exception keeps the already-persisted origins recoverable.
+    Uses ``_route_identity`` so presentation hints ('auto_thread_created',
+    'auto_thread_initial_name') are stripped under the shipped comparator, while a
+    pre-fix comparator (which keeps them) refuses admission.
+
+    Preserves:
+    - Metadata enrichment on human message: when the origin was recorded before Discord
+      channel metadata arrived, non-null ``chat_name`` and ``scope_id``/``guild_id`` on
+      the committed human envelope do not conflict with ``None`` in the event origin.
+      However, if the event origin carries non-null ``chat_name`` or ``scope_id``, it must
+      match the committed envelope.
+    - Historical placeholder user_name: ``_NATIVE_START_PLACEHOLDER_USER_NAME`` ('operator')
+      or None on the event origin may recover to the real display name on the committed
+      envelope under the same proven route and user_id. Renamed real user_name still refuses.
+    - All other routing drifts (chat_id, chat_type, user_id, thread_id, parent_chat_id,
+      profile, prospective_thread_id) strictly refuse.
     """
     if runner.session_store._generate_session_key(restored_source) != entry.session_key:
         return False
     if runner.session_store._generate_session_key(event_source) != entry.session_key:
         return False
 
-    routing_keys = ('platform', 'chat_id', 'chat_type', 'thread_id', 'parent_chat_id', 'user_id')
-    for key in routing_keys:
-        v1 = getattr(restored_source, key, None)
-        v2 = getattr(event_source, key, None)
-        if v1 is not None and v2 is not None and v1 != v2:
-            return False
+    r1 = _route_identity(restored_source)
+    r2 = _route_identity(event_source)
 
-    s1 = getattr(restored_source, 'scope_id', None) or getattr(restored_source, 'guild_id', None)
-    s2 = getattr(event_source, 'scope_id', None) or getattr(event_source, 'guild_id', None)
-    if s1 is not None and s2 is not None and s1 != s2:
+    if _ROUTE_PRESENTATION_HINTS & (set(r1) | set(r2)):
         return False
 
-    for key in ('user_name', 'profile', 'prospective_thread_id'):
-        v1 = getattr(restored_source, key, None)
-        v2 = getattr(event_source, key, None)
-        if key == 'user_name' and _NATIVE_START_PLACEHOLDER_USER_NAME in (v1, v2):
-            continue  # an unknown display name, not a distinct identity
-        if v1 is not None and v2 is not None and v1 != v2:
+    for key in ('platform', 'chat_id', 'chat_type', 'thread_id', 'parent_chat_id', 'user_id'):
+        if r1.get(key) != r2.get(key):
+            return False
+
+    for key in ('profile', 'prospective_thread_id'):
+        if r1.get(key) != r2.get(key):
+            return False
+
+    s1 = r1.get('scope_id') or r1.get('guild_id')
+    s2 = r2.get('scope_id') or r2.get('guild_id')
+    if s2 is not None and s1 != s2:
+        return False
+
+    c1 = r1.get('chat_name')
+    c2 = r2.get('chat_name')
+    if c2 is not None and c1 != c2:
+        return False
+
+    u1 = r1.get('user_name')
+    u2 = r2.get('user_name')
+    if u1 != u2:
+        if u2 not in (_NATIVE_START_PLACEHOLDER_USER_NAME, None):
+            return False
+
+    for key, v2 in r2.items():
+        if key in ('platform', 'chat_id', 'chat_type', 'thread_id', 'parent_chat_id',
+                   'user_id', 'profile', 'prospective_thread_id', 'scope_id', 'guild_id',
+                   'chat_name', 'user_name'):
+            continue
+        if v2 is not None and r1.get(key) != v2:
             return False
 
     return True
