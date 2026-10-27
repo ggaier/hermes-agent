@@ -903,8 +903,24 @@ class SessionAuthority:
                     await tracked_write(self, partial(reopen_local_session, self, ref))
             if first is not None and 'native_text_v1' in first['payload']:
                 from gateway.session_envelope import check_native_route
-                await check_native_route(self.runner, first['payload'], self.physical_target(ref), live.source,
-                                   self.runner._adapter_for_source(live.source))
+                try:
+                    await check_native_route(self.runner, first['payload'], self.physical_target(ref), live.source,
+                                       self.runner._adapter_for_source(live.source))
+                except RuntimeStoreError:
+                    # The preflight's own refusal (admission_conflict, permission_denied,
+                    # profile_mismatch, not_found) is a ValueError subclass and IS the reason to
+                    # pause with: rewriting it would name a decode failure the head never had.
+                    raise
+                except (KeyError, TypeError, ValueError) as exc:
+                    # A committed row can predate (or corrupt) the native shape the decoder reads.
+                    # Contain only that decode failure at the preclaim: the FIFO pauses with a
+                    # visible reason and the rows stay queued. Storage and internal errors keep
+                    # their own handling, and the payload is never logged.
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        'Session %s has an undecodable queued head %s (%s: %s); pausing in invalid_params',
+                        ref.session_id, first['admission_id'], type(exc).__name__, exc, exc_info=exc)
+                    raise RuntimeStoreError('invalid_params') from exc
                 # Cancellation may advance FIFO while the connector is awaited.
                 # Never let the successor inherit this row's fresh verdict.
                 current = get_session_admission(self.db, admission_id=first['admission_id'])

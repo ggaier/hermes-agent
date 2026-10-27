@@ -456,6 +456,9 @@ def snapshot_automation(authority, adapter, event, identity):
         if runner._adapter_for_source(event.source) is not adapter or bound_adapter is not adapter:
             raise RuntimeStoreError('admission_conflict')
         source = deepcopy(event.source.to_dict())
+        # ``to_dict`` omits the platform-neutral bot flag, but the decoder reads it
+        # unconditionally. Re-attach it exactly as a native snapshot does.
+        source['is_bot'] = event.source.is_bot
         source.pop('message_id', None)
         envelope = {
             'source': source,

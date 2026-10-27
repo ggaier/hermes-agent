@@ -234,12 +234,29 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
     return payload
 
 
+def _restore_is_bot(envelope):
+    """The platform-neutral bot flag, absent from ``SessionSource.to_dict`` by design.
+
+    Rows committed before the producer stamped the flag are still queued with an internal
+    automation descriptor; only that legacy path may default it. Everything else refuses so a
+    missing or truthy-coerced value never silently changes the sender identity."""
+    raw = envelope['source']
+    if 'is_bot' not in raw:
+        if 'automation' not in envelope:
+            raise RuntimeStoreError('invalid_params', field='is_bot', detail='missing')
+        return False
+    flag = raw['is_bot']
+    if type(flag) is not bool:
+        raise RuntimeStoreError('invalid_params', field='is_bot', detail=type(flag).__name__)
+    return flag
+
+
 def restore_native_source(payload, runner=None):
     """restore_native's source (provenance included) without re-verifying the captured media:
     admission needs only the route; execution's restore_native still checks every byte."""
     envelope = payload['native_text_v1']
     source = SessionSource.from_dict(envelope['source'])
-    source.is_bot = envelope['source']['is_bot']
+    source.is_bot = _restore_is_bot(envelope)
     # Private descriptor requests a fresh check, never supplies the verdict.
     source.role_authorized = envelope.get('reauthorize') == 'roles'
     if 'provenance' in envelope:
