@@ -13,7 +13,6 @@ Two behaviours are pinned here:
 
 import asyncio
 import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -80,13 +79,15 @@ def test_on_timeout_withdraws_exact_request_and_wakes_backend_waiter():
     entry = _entry("req-a", "rm -rf /tmp/card33-a")
     _enqueue(entry)
     waiter = {}
+    started = threading.Event()
 
     def _wait():
+        started.set()
         waiter["state"] = _poll_event(entry.event, KEY, interrupt_log="waiter")
 
     thread = threading.Thread(target=_wait, daemon=True)
     thread.start()
-    time.sleep(0.15)
+    assert started.wait(2.0), "precondition: the backend waiter thread started"
     assert thread.is_alive(), "precondition: the backend waiter is still blocked"
 
     try:
@@ -177,3 +178,29 @@ async def test_timeout_without_request_id_leaves_queue_untouched():
     assert other.result is None
     assert other.event.is_set() is False
     assert [d["request_id"] for d in approval_mod.list_gateway_approvals(KEY)] == ["req-other"]
+
+
+def test_expiry_withdraws_even_when_the_card_edit_hangs():
+    """The embed edit is a network call: a hung edit must not keep the backend waiting."""
+    _reset()
+    entry = _entry("req-hang", "rm -rf /tmp/card33-hang")
+    _enqueue(entry)
+
+    class _HangingMessage:
+        embeds: list = []
+
+        async def edit(self, **_kwargs):
+            await asyncio.Event().wait()  # never completes
+
+    view = _view("req-hang")
+    view._message = _HangingMessage()
+
+    async def _expire():
+        await asyncio.wait_for(view.on_timeout(), timeout=2.0)
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(_expire())
+
+    assert entry.event.is_set(), "withdraw waited on the Discord message edit instead of running first"
+    assert entry.cancelled == "timeout"
+    assert entry.result is None

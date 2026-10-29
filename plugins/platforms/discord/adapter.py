@@ -6494,15 +6494,20 @@ def _define_discord_view_classes() -> None:
             The inherited behaviour only greys the card; the backend ``_poll_event`` then kept
             waiting ``approvals.timeout`` (86400s in production) for an answer nobody could give,
             which is what left three threads "running" for hours behind expired cards.
+
+            Withdraw FIRST: the embed edit is a network call that can hang or fail, and the wait
+            must end even when the tidy-up never completes.
             """
-            await super().on_timeout()
-            if not self.request_id:
-                return
+            if self.request_id:
+                try:
+                    from tools.approval import withdraw_gateway_approval
+                    withdraw_gateway_approval(self.session_key, self.request_id, "timeout")
+                except Exception as exc:  # never let a UI callback raise into discord.py
+                    logger.warning("[Discord] approval withdraw on timeout failed: %s", exc)
             try:
-                from tools.approval import withdraw_gateway_approval
-                withdraw_gateway_approval(self.session_key, self.request_id, "timeout")
-            except Exception as exc:  # never let a UI callback raise into discord.py
-                logger.warning("[Discord] approval withdraw on timeout failed: %s", exc)
+                await super().on_timeout()
+            except Exception as exc:
+                logger.warning("[Discord] approval card expiry edit failed: %s", exc)
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Base admission always required; with ``require_admin`` the clicker must
