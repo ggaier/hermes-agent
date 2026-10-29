@@ -196,6 +196,29 @@ def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> 
     return True
 
 
+def withdraw_all_gateway_approvals(cause: str) -> int:
+    """Withdraw every pending gateway approval (restart/shutdown), waking each waiter fail-closed.
+
+    A turn whose only activity is "waiting for user approval" heartbeats, so a restart drain counts
+    it as awaitable work and sits out the whole ``restart_after_turn_timeout`` cap for an answer that
+    is no longer possible (observed: `gateway restart --force` waiting 2000+ s). Withdrawing here
+    makes each waiting tool deny itself with ``cause``, so its turn ends and the drain proceeds.
+    Nothing is approved and nothing is replayed.
+    """
+    with _lock:
+        queues = list(_gateway_queues.items())
+        total = 0
+        for _session_key, queue in queues:
+            for entry in list(queue):
+                entry.cancelled = cause
+                # A withdrawn prompt is over: report it as a timeout-shaped end, never a user deny.
+                entry.expired = True
+                entry.event.set()
+                total += 1
+        _gateway_queues.clear()
+    return total
+
+
 def list_gateway_approvals(session_key: str) -> list[dict]:
     """Return replay-safe snapshots of unresolved approvals for one session."""
     with _lock:

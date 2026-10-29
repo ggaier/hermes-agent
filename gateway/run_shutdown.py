@@ -1608,12 +1608,30 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
         return units
 
+    def _withdraw_pending_approvals_for_restart(self) -> int:
+        """End approval waits nobody can answer (fail-closed), so they cannot hold the restart."""
+        try:
+            from tools.approval import withdraw_all_gateway_approvals
+            count = withdraw_all_gateway_approvals("the gateway restarted while this approval was pending")
+        except Exception:
+            logger.debug("Restart: withdrawing pending approvals failed", exc_info=True)
+            return 0
+        if count:
+            logger.warning(
+                "Restart: withdrew %d pending approval(s) fail-closed — their turns deny and the "
+                "drain proceeds instead of waiting for an answer that cannot arrive", count)
+        return count
+
     async def _await_active_work_before_restart(self) -> bool:
         """Wait for in-flight work before ``stop()`` so the requesting turn isn't force-interrupted.
 
         Wedged turns are excluded (restart is their remedy). True when drained to zero, False when the
         cap elapsed or only wedged work remains (caller proceeds to ``stop()``).
         """
+        # A turn parked on a human approval can never finish by itself; its heartbeat also keeps it
+        # out of the wedged set. Withdraw those prompts fail-closed first, so the wait that follows
+        # is bounded by real work instead of sitting out the whole cap (2000+ s in production).
+        self._withdraw_pending_approvals_for_restart()
         active = self._active_work_count()
         if active <= 0:
             return True
