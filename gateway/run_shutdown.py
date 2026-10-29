@@ -30,6 +30,7 @@ from gateway.restart import (
 from gateway.run_common import _UNSET
 from gateway.run_runtime import managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
+from gateway.shutdown_delivery import send_error as _send_error, send_failed as _send_failed
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
@@ -132,16 +133,6 @@ def _log_suppressed(level: int, msg: str, *args, exc_info: bool = False):
             logger.log(level, msg, *args, exc_info=(type(exc), exc, exc.__traceback__))
         else:
             logger.log(level, msg, *args, exc)
-
-
-def _send_failed(result: Any) -> bool:
-    """True when an adapter ``send()`` result explicitly reports failure."""
-    return result is not None and getattr(result, "success", True) is False
-
-
-def _send_error(result: Any) -> str:
-    """Error text of a failed ``send()`` result (adapters may omit it)."""
-    return getattr(result, "error", "send returned success=False")
 
 
 def _notice_target_key(platform_value: str, chat_id, thread_id) -> tuple:
@@ -1608,20 +1599,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
         return units
 
-    def _withdraw_pending_approvals_for_restart(self) -> int:
-        """End approval waits nobody can answer (fail-closed), so they cannot hold the restart."""
-        try:
-            from tools.approval import begin_approval_withdrawal
-            count = begin_approval_withdrawal("the gateway restarted while this approval was pending")
-        except Exception:
-            logger.debug("Restart: withdrawing pending approvals failed", exc_info=True)
-            return 0
-        if count:
-            logger.warning(
-                "Restart: withdrew %d pending approval(s) fail-closed — their turns deny and the "
-                "drain proceeds instead of waiting for an answer that cannot arrive", count)
-        return count
-
     async def _await_active_work_before_restart(self) -> bool:
         """Wait for in-flight work before ``stop()`` so the requesting turn isn't force-interrupted.
 
@@ -1700,10 +1677,10 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
-        self._restart_withdraw_approvals = withdraw_approvals
         self._restart_task_started = True
         if withdraw_approvals:
-            self._withdraw_pending_approvals_for_restart()
+            from gateway.restart_approval_policy import withdraw_pending_approvals_for_restart
+            withdraw_pending_approvals_for_restart()
         # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
         self._draining = True
         from gateway.drain_control import open_restart_wait

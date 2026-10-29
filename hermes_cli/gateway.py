@@ -3914,6 +3914,8 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
 # =============================================================================
 
 
+from hermes_cli.gateway_service_backend import service_backend as _service_backend
+from hermes_cli.gateway_output import print_indented as _print_indented
 from hermes_cli.gateway_launchd import (
     get_launchd_label,
     _probe_launchd_domain_for_label,
@@ -4782,23 +4784,6 @@ def _is_service_running() -> bool:
 
 
 
-def _print_indented(text: str, emit=print) -> None:
-    for line in text.splitlines():
-        emit(f"  {line}")
-
-
-def _service_backend(*, windows: bool = True) -> str | None:
-    """Host service manager: ``"systemd"`` / ``"launchd"`` / ``"windows"`` / None, in the canonical
-    predicate order every subcommand routes on. ``windows=False`` never probes ``is_windows()``."""
-    if supports_systemd_services():
-        return "systemd"
-    if is_macos():
-        return "launchd"
-    if windows and is_windows():
-        return "windows"
-    return None
-
-
 def _service_call(backend: str, verb: str, system: bool | None = False, **kwargs) -> None:
     """Run ``verb`` (start/stop/restart/uninstall) on ``backend``. Names resolve at call time so tests
     can monkeypatch them; only systemd takes a scope, and ``system=None`` omits it (wizard restart)."""
@@ -5468,33 +5453,8 @@ def _refuse_restart_of_service_managed_gateway(pid: int | None) -> None:
 
 def _cmd_restart(args):
     _refuse_from_inside_gateway("restart", "restart loops")
-    withdraw_approvals = getattr(args, "withdraw_approvals", False)
-    if withdraw_approvals:
-        system = getattr(args, "system", False)
-        restart_all = getattr(args, "all", False)
-        if restart_all or system:
-            print("Error: --withdraw-approvals is not supported for this target in this release.")
-            sys.exit(1)
-        name = _current_profile_name()
-        if name and name != "default" and not getattr(args, "force", False):
-            home = get_hermes_home()
-            from hermes_cli.gateway_profile_lifecycle import profile_is_standalone
-            if not profile_is_standalone(home):
-                owner = _served_by_another_host_gateway()
-                if owner is not None or named_profile_served_by_running_multiplexer():
-                    print("Error: --withdraw-approvals is not supported for this target in this release.")
-                    sys.exit(1)
-        try:
-            from hermes_cli.service_manager import detect_service_manager
-            if detect_service_manager() == "s6":
-                print("Error: --withdraw-approvals is not supported for this target in this release.")
-                sys.exit(1)
-        except Exception:
-            pass
-        kind = _installed_service_kind_for(is_windows)
-        if kind != "launchd":
-            print("Error: --withdraw-approvals is not supported for this target in this release.")
-            sys.exit(1)
+    from hermes_cli.gateway_restart_policy import restart_withdraw_approvals
+    withdraw_approvals = restart_withdraw_approvals(args)
 
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("restart", args):
@@ -5530,7 +5490,12 @@ def _cmd_restart(args):
     if kind is not None:
         swallow = (RuntimeError, OSError) if kind == "windows" else ()
         try:
-            _service_call(kind, "restart", system, withdraw_approvals=withdraw_approvals)
+            # Only the opt-in policy needs the extra argument: the plain restart path keeps the
+            # original three-argument call so existing backends/callers are untouched.
+            if withdraw_approvals:
+                _service_call(kind, "restart", system, withdraw_approvals=True)
+            else:
+                _service_call(kind, "restart", system)
             return
         except (subprocess.CalledProcessError, *swallow):
             pass

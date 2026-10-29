@@ -160,32 +160,47 @@ async def test_status_authority_fences_stale_prompts_and_falls_back(tmp_path, mo
         runner.adapters[Platform.TELEGRAM]._pending_messages = {key: object()}
         admit_session_input(authority.db, epoch=authority.epoch, principal_id="status", session_id=ref.session_id,
                             request_id="followon", payload={"text": "two"})
-        if case == "superseded":
+
+        def superseded():
             live.superseded = True
-        elif case == "stale_generation":
+
+        def stale_generation():
             live.controls.register(ref.session_id, key, row["generation"] - 1, pending.data)
-        elif case in {"idle", "idle_live"}:
+
+        def idle():
             settle_session_input(authority.db, epoch=authority.epoch, admission_id=row["admission_id"],
                                  generation=row["generation"], outcome="completed")
-            if case == "idle":
-                runner._running_agents.pop(key)
-        elif case == "unknown":
-            epoch = begin_runtime_epoch(authority.db, instance_id="replacement")
-            recover_session_inputs(authority.db, epoch=epoch)
-        elif case == "other_profile":
-            from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+            runner._running_agents.pop(key)
+
+        def idle_live():
+            settle_session_input(authority.db, epoch=authority.epoch, admission_id=row["admission_id"],
+                                 generation=row["generation"], outcome="completed")
+
+        def unknown():
+            replacement = begin_runtime_epoch(authority.db, instance_id="replacement")
+            recover_session_inputs(authority.db, epoch=replacement)
+
+        def other_profile():
+            from hermes_constants import set_hermes_home_override
             registry = SessionAuthorities(tmp_path / "launch", multiplexed=True)
             registry.add(tmp_path / "launch", authority)
             runner.session_authorities = registry
-            token = set_hermes_home_override(str(tmp_path / "unserved"))
-        elif case == "unavailable":
-            def unavailable(_ref):
+            return set_hermes_home_override(str(tmp_path / "unserved"))
+
+        def unavailable():
+            def raise_unavailable(_ref):
                 raise sqlite3.OperationalError("test-private ledger unavailable")
-            monkeypatch.setattr(authority, "_pending_rows", unavailable)
+            monkeypatch.setattr(authority, "_pending_rows", raise_unavailable)
+
+        setups = {"superseded": superseded, "stale_generation": stale_generation,
+                  "idle": idle, "idle_live": idle_live, "unknown": unknown,
+                  "other_profile": other_profile, "unavailable": unavailable}
+        token = setups[case]()
         try:
             result = await runner._handle_message(_make_event("/status"))
         finally:
             if case == "other_profile":
+                from hermes_constants import reset_hermes_home_override
                 reset_hermes_home_override(token)
         assert f"**Phase:** {expected}" in result
         assert "Waiting for approval" not in result

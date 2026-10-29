@@ -123,9 +123,10 @@ async def test_graceful_restart_keeps_already_pending_and_late_approvals_answera
     assert started1.wait(5.0)
     assert started2.wait(5.0)
 
-    # Runner requests plain graceful restart (withdraw_approvals=False)
+    # Runner requests plain graceful restart (withdraw_approvals=False); yield once so the
+    # scheduled restart task starts, without waiting on the wall clock.
     runner.request_restart(detached=False, via_service=True)
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0)
 
     # Waiters must still be on the queue (NOT eagerly withdrawn)
     assert len(approval_mod.list_gateway_approvals(s1)) == 1
