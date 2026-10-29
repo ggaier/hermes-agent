@@ -35,7 +35,7 @@ from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
     _user_deny_block_result,
 )
-from tools.approval_gateway_wait import _await_gateway_decision
+from tools.approval_gateway_wait import _GatewayNotify, _await_gateway_decision
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
 
@@ -127,7 +127,7 @@ def register_gateway_notify(session_key: str, cb) -> None:
     """Register ``cb(approval_data: dict) -> None`` for sending approval requests. The callback
     bridges sync→async: it runs in the agent thread and must schedule the send on the loop."""
     with _lock:
-        _gateway_notify_cbs[session_key] = cb
+        _gateway_notify_cbs[session_key] = _GatewayNotify(cb)
 
 
 def unregister_gateway_notify(session_key: str) -> None:
@@ -321,6 +321,11 @@ def clear_session(session_key: str) -> None:
         _session_yolo.discard(session_key)
         _launch_yolo_applied.discard(session_key)
         _pending.pop(session_key, None)
+        notify = _gateway_notify_cbs.get(session_key)
+        if isinstance(notify, _GatewayNotify):
+            notify.cancelled = "the session ended before the prompt was answered"
+            # Keep the live channel, but captures from before /new must not enter its new queue.
+            _gateway_notify_cbs[session_key] = _GatewayNotify(notify.callback)
         for entry in _gateway_queues.pop(session_key, []):
             # Cancel blocked waits now so the old run unwinds instead of idling until timeout;
             # the prompt was withdrawn, nobody denied it.

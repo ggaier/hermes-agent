@@ -22,6 +22,21 @@ from tools.approval_human_wait import activity_heartbeat, human_wait_window
 logger = logging.getLogger("tools.approval")
 
 
+class _GatewayNotify:
+    """One registration lifetime, even when the same callable is registered again.
+
+    Only registered callbacks carry this guard; standalone wait callbacks remain supported.
+    Cancellation and registry identity are read/written under the approval lock.
+    """
+
+    def __init__(self, callback):
+        self.callback = callback
+        self.cancelled: str | None = None
+
+    def __call__(self, data):
+        return self.callback(data)
+
+
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
     __slots__ = ("acknowledged", "cancelled", "data", "event", "expired", "reason", "result", "settle")
@@ -172,15 +187,22 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     # followers to prompt for themselves; they re-coalesce behind whichever re-prompts first, so the
     # user still sees one prompt at a time (the answered leader is already off the queue).
     while True:
+        cancelled = None
         with _approval._lock:
+            if isinstance(notify_cb, _GatewayNotify):
+                cancelled = notify_cb.cancelled
+                if _approval._gateway_notify_cbs.get(session_key) is not notify_cb:
+                    cancelled = cancelled or "the turn ended before the prompt was answered"
             leader = None
-            if not preparing_terminal_approval():
+            if not cancelled and not preparing_terminal_approval():
                 leader = next((e for e in _approval._gateway_queues.get(session_key, [])
                                if e.data.get("command") == approval_data.get("command")
                                and list(e.data.get("pattern_keys") or []) == keys), None)
-            if leader is None:
+            if not cancelled and leader is None:
                 _enqueue()
                 break
+        if cancelled:
+            return _finish(payload, False, None, None, cancelled=cancelled)
         adopted = _await_coalesced_leader(session_key, leader, payload)
         if adopted is not None:
             return adopted

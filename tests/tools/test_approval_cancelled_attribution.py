@@ -97,6 +97,42 @@ def test_turn_end_unregister_reports_withdrawn_prompt(gateway_session):
     assert "denied by user" in denied["message"]
 
 
+def test_unregister_between_callback_lookup_and_enqueue_cancels(gateway_session, monkeypatch):
+    captured = threading.Event()
+    release = threading.Event()
+    notified = []
+    holder = {}
+    lookup = mod._gateway_notify_cb
+
+    def paused_lookup(session_key):
+        callback = lookup(session_key)
+        captured.set()
+        assert release.wait(10)
+        return callback
+
+    monkeypatch.setattr(mod, "_gateway_notify_cb", paused_lookup)
+    mod.register_gateway_notify(SESSION_KEY, notified.append)
+    thread = threading.Thread(target=lambda: holder.setdefault(
+        "result", mod.check_all_command_guards("rm -rf .git", "local")), daemon=True)
+    thread.start()
+    try:
+        assert captured.wait(10)
+        mod.unregister_gateway_notify(SESSION_KEY)
+        release.set()
+        thread.join(2)
+        assert not thread.is_alive(), "teardown left a late approval waiter blocked"
+        assert not mod.has_blocking_approval(SESSION_KEY)
+        assert notified == []
+        _assert_withdrawn(holder["result"], "the turn ended before the prompt was answered")
+        assert not mod._session_approved.get(SESSION_KEY)
+        posts = [kw for name, kw in gateway_session if name == "post_approval_response"]
+        assert posts[-1]["choice"] == "cancelled"
+    finally:
+        release.set()
+        mod.unregister_gateway_notify(SESSION_KEY)
+        thread.join(10)
+
+
 def test_session_boundary_teardown_reports_withdrawn_prompt(gateway_session):
     """``clear_session`` (/new, /reset, auto-reset) wakes the wait with no decision: the result
     is a withdrawn prompt, not a user deny."""
