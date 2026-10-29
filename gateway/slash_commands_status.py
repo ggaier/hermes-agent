@@ -252,6 +252,13 @@ class GatewayStatusCommandsMixin:
         # Pending /queue follow-ups (slot + overflow).
         adapter = self.adapters.get(source.platform) if source else None
         queue_depth = self._queue_depth(session_key, adapter=adapter)
+        from gateway.session_status_projection import status_projection
+        projection = await asyncio.to_thread(status_projection, self, session_entry.session_id, session_key)
+        phase = "running" if agent is not None else "idle"
+        if projection is not None:
+            phase, queue_depth = projection
+        elif queue_depth and agent is None:
+            phase = "queued"
         title, session_row, db_total_tokens, persisted_route = await self._status_session_db_facts(
             session_entry.session_id
         )
@@ -298,6 +305,7 @@ class GatewayStatusCommandsMixin:
         state = t("gateway.status.state_yes") if fields["agent_running"] else t("gateway.status.state_no")
         lines += [t("gateway.status.tokens", tokens=fields["tokens"]),
                   t("gateway.status.agent_running", state=state)]
+        lines.append(t("gateway.status.phase", phase=t("gateway.status.phase_" + phase)))
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
         if source.platform == Platform.MATRIX:

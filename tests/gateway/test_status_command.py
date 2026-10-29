@@ -82,6 +82,122 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
 
 
 @pytest.mark.asyncio
+async def test_status_pending_authority_approval_and_durable_followon(tmp_path):
+    from gateway.session_authority import initialize_session_authority
+    from hermes_state_runtime import admit_session_input, claim_session_input
+    from tools import approval
+    from tools.approval_gateway_wait import _ApprovalEntry
+
+    source = _make_source()
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(source)
+    runner = _make_runner(entry)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_db = AsyncSessionDB(store._db)
+    runner._draining = False
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="status")
+    ref = authority.register(source)
+    key = entry.session_key
+    pending = _ApprovalEntry({"request_id": "status-approval", "command": "inert status payload"})
+    try:
+        admit_session_input(authority.db, epoch=authority.epoch, principal_id="status", session_id=ref.session_id,
+                            request_id="first", payload={"text": "one"})
+        row = claim_session_input(authority.db, epoch=authority.epoch, session_id=ref.session_id)
+        with approval._lock:
+            approval._gateway_queues.setdefault(key, []).append(pending)
+        authority.register_approval(ref.session_id, row["generation"], key, pending.data)
+        admit_session_input(authority.db, epoch=authority.epoch, principal_id="status", session_id=ref.session_id,
+                            request_id="followon", payload={"text": "two"})
+        runner._running_agents[key] = SimpleNamespace(model="", provider="")
+        result = await runner._handle_message(_make_event("/status"))
+        assert "**Phase:** Waiting for approval" in result
+        assert "**Queued follow-ups:** 1" in result
+        assert "**Agent Running:** Yes" in result
+    finally:
+        approval.withdraw_gateway_approval(key, pending.data["request_id"], "test cleanup")
+        store._db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case, expected", [
+    ("superseded", "Running"), ("stale_generation", "Running"),
+    ("idle", "Queued"), ("idle_live", "Running"), ("unknown", "Unknown"), ("other_profile", "Running"),
+    ("unavailable", "Running"),
+])
+async def test_status_authority_fences_stale_prompts_and_falls_back(tmp_path, monkeypatch, case, expected):
+    import sqlite3
+    from gateway.session_authorities import SessionAuthorities
+    from gateway.session_authority import initialize_session_authority
+    from hermes_state_runtime import (
+        admit_session_input, begin_runtime_epoch, claim_session_input, recover_session_inputs, settle_session_input,
+    )
+    from tools import approval
+    from tools.approval_gateway_wait import _ApprovalEntry
+
+    source = _make_source()
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    entry = store.get_or_create_session(source)
+    runner = _make_runner(entry)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._session_db = AsyncSessionDB(store._db)
+    runner._draining = False
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="status-fences")
+    ref = authority.register(source)
+    key = entry.session_key
+    pending = _ApprovalEntry({"request_id": "status-fenced", "command": "inert payload"})
+    try:
+        admit_session_input(authority.db, epoch=authority.epoch, principal_id="status", session_id=ref.session_id,
+                            request_id="first", payload={"text": "one"})
+        row = claim_session_input(authority.db, epoch=authority.epoch, session_id=ref.session_id)
+        with approval._lock:
+            approval._gateway_queues.setdefault(key, []).append(pending)
+        authority.register_approval(ref.session_id, row["generation"], key, pending.data)
+        live = authority.sessions[ref.session_id]
+        runner._running_agents[key] = SimpleNamespace(model="", provider="")
+        # Deliberately overlap legacy and durable input: projection must never add them.
+        runner.adapters[Platform.TELEGRAM]._pending_messages = {key: object()}
+        admit_session_input(authority.db, epoch=authority.epoch, principal_id="status", session_id=ref.session_id,
+                            request_id="followon", payload={"text": "two"})
+        if case == "superseded":
+            live.superseded = True
+        elif case == "stale_generation":
+            live.controls.register(ref.session_id, key, row["generation"] - 1, pending.data)
+        elif case in {"idle", "idle_live"}:
+            settle_session_input(authority.db, epoch=authority.epoch, admission_id=row["admission_id"],
+                                 generation=row["generation"], outcome="completed")
+            if case == "idle":
+                runner._running_agents.pop(key)
+        elif case == "unknown":
+            epoch = begin_runtime_epoch(authority.db, instance_id="replacement")
+            recover_session_inputs(authority.db, epoch=epoch)
+        elif case == "other_profile":
+            from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+            registry = SessionAuthorities(tmp_path / "launch", multiplexed=True)
+            registry.add(tmp_path / "launch", authority)
+            runner.session_authorities = registry
+            token = set_hermes_home_override(str(tmp_path / "unserved"))
+        elif case == "unavailable":
+            def unavailable(_ref):
+                raise sqlite3.OperationalError("test-private ledger unavailable")
+            monkeypatch.setattr(authority, "_pending_rows", unavailable)
+        try:
+            result = await runner._handle_message(_make_event("/status"))
+        finally:
+            if case == "other_profile":
+                reset_hermes_home_override(token)
+        assert f"**Phase:** {expected}" in result
+        assert "Waiting for approval" not in result
+        assert "**Queued follow-ups:** 1" in result
+        if case in {"superseded", "stale_generation", "idle", "idle_live", "unknown"}:
+            assert not live.controls.pending
+    finally:
+        approval.withdraw_gateway_approval(key, pending.data["request_id"], "test cleanup")
+        store._db.close()
+
+
+@pytest.mark.asyncio
 async def test_status_command_reads_token_totals_from_session_db():
     """Regression test for #17158: /status must source token totals from the
     SQLite SessionDB (where run_agent.py persists them) and sum all component
