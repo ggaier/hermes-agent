@@ -22,6 +22,8 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     # which changes the restart call signature.
     monkeypatch.delenv("INVOCATION_ID", raising=False)
     monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    # Inherited launchd wrapper labels also select supervised restarts.
+    monkeypatch.delenv("HERMES_LAUNCHD_LABEL", raising=False)
     monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", raising=False)
     # Hermeticity: neutralize the real container probe (see
