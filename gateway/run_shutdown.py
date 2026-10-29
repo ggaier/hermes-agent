@@ -1611,8 +1611,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
     def _withdraw_pending_approvals_for_restart(self) -> int:
         """End approval waits nobody can answer (fail-closed), so they cannot hold the restart."""
         try:
-            from tools.approval import withdraw_all_gateway_approvals
-            count = withdraw_all_gateway_approvals("the gateway restarted while this approval was pending")
+            from tools.approval import begin_approval_withdrawal
+            count = begin_approval_withdrawal("the gateway restarted while this approval was pending")
         except Exception:
             logger.debug("Restart: withdrawing pending approvals failed", exc_info=True)
             return 0
@@ -1628,10 +1628,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         Wedged turns are excluded (restart is their remedy). True when drained to zero, False when the
         cap elapsed or only wedged work remains (caller proceeds to ``stop()``).
         """
-        # A turn parked on a human approval can never finish by itself; its heartbeat also keeps it
-        # out of the wedged set. Withdraw those prompts fail-closed first, so the wait that follows
-        # is bounded by real work instead of sitting out the whole cap (2000+ s in production).
-        self._withdraw_pending_approvals_for_restart()
         active = self._active_work_count()
         if active <= 0:
             return True
@@ -1692,13 +1688,22 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
         return True
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    def request_restart(
+        self,
+        *,
+        detached: bool = False,
+        via_service: bool = False,
+        withdraw_approvals: bool = False,
+    ) -> bool:
         if self._restart_task_started:
             return False
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
+        self._restart_withdraw_approvals = withdraw_approvals
         self._restart_task_started = True
+        if withdraw_approvals:
+            self._withdraw_pending_approvals_for_restart()
         # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
         self._draining = True
         from gateway.drain_control import open_restart_wait

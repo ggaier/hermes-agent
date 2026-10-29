@@ -4799,13 +4799,13 @@ def _service_backend(*, windows: bool = True) -> str | None:
     return None
 
 
-def _service_call(backend: str, verb: str, system: bool | None = False) -> None:
+def _service_call(backend: str, verb: str, system: bool | None = False, **kwargs) -> None:
     """Run ``verb`` (start/stop/restart/uninstall) on ``backend``. Names resolve at call time so tests
     can monkeypatch them; only systemd takes a scope, and ``system=None`` omits it (wizard restart)."""
     if backend == "windows":
         return getattr(_gw_windows(), verb)()
     if backend == "launchd":
-        return globals()[f"launchd_{verb}"]()
+        return globals()[f"launchd_{verb}"](**kwargs)
     fn = globals()[f"systemd_{verb}"]
     return fn() if system is None else fn(system=system)
 
@@ -5468,6 +5468,34 @@ def _refuse_restart_of_service_managed_gateway(pid: int | None) -> None:
 
 def _cmd_restart(args):
     _refuse_from_inside_gateway("restart", "restart loops")
+    withdraw_approvals = getattr(args, "withdraw_approvals", False)
+    if withdraw_approvals:
+        system = getattr(args, "system", False)
+        restart_all = getattr(args, "all", False)
+        if restart_all or system:
+            print("Error: --withdraw-approvals is not supported for this target in this release.")
+            sys.exit(1)
+        name = _current_profile_name()
+        if name and name != "default" and not getattr(args, "force", False):
+            home = get_hermes_home()
+            from hermes_cli.gateway_profile_lifecycle import profile_is_standalone
+            if not profile_is_standalone(home):
+                owner = _served_by_another_host_gateway()
+                if owner is not None or named_profile_served_by_running_multiplexer():
+                    print("Error: --withdraw-approvals is not supported for this target in this release.")
+                    sys.exit(1)
+        try:
+            from hermes_cli.service_manager import detect_service_manager
+            if detect_service_manager() == "s6":
+                print("Error: --withdraw-approvals is not supported for this target in this release.")
+                sys.exit(1)
+        except Exception:
+            pass
+        kind = _installed_service_kind_for(is_windows)
+        if kind != "launchd":
+            print("Error: --withdraw-approvals is not supported for this target in this release.")
+            sys.exit(1)
+
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("restart", args):
         return
@@ -5502,7 +5530,7 @@ def _cmd_restart(args):
     if kind is not None:
         swallow = (RuntimeError, OSError) if kind == "windows" else ()
         try:
-            _service_call(kind, "restart", system)
+            _service_call(kind, "restart", system, withdraw_approvals=withdraw_approvals)
             return
         except (subprocess.CalledProcessError, *swallow):
             pass

@@ -776,7 +776,7 @@ def _wait_for_launchd_service_pid(
         time.sleep(0.5)
 
 
-def launchd_restart():
+def launchd_restart(withdraw_approvals: bool = False):
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
@@ -793,6 +793,22 @@ def launchd_restart():
     from gateway.status import get_running_pid
     try:
         pid = get_running_pid()
+        if withdraw_approvals:
+            if pid is None:
+                print("✗ Cannot restart gateway: no running gateway process found.")
+                sys.exit(1)
+            from gateway.control_socket import query_gateway_control
+            res = query_gateway_control(
+                _gw().get_hermes_home(),
+                "restart-withdraw-approvals",
+                params={"policy": "withdraw_approvals", "withdraw_approvals": True},
+            )
+            if not (isinstance(res, dict) and res.get("pid") == pid and res.get("accepted") and res.get("policy") == "withdraw_approvals"):
+                print("✗ Gateway restart with approval withdrawal failed: control verb unsupported or missing ACK.")
+                sys.exit(1)
+            _launchd_ok("✓ Service restart requested")
+            return
+
         if pid is not None and _gw()._request_gateway_self_restart(pid):
             _launchd_ok("✓ Service restart requested")
             return

@@ -141,6 +141,9 @@ def build_gateway_parser(
     _flag(gateway_restart, "--all",
         help="Kill ALL gateway processes across all profiles before restarting")
     _flag(gateway_restart, "--force", help=_FORCE_SERVED_PROFILE_HELP)
+    _flag(gateway_restart, "--withdraw-approvals",
+        help="Withdraw pending approval waits fail-closed so the restart drain is not held by a prompt "
+             "nobody can answer (implies no approval and no kill; macOS/launchd only in this release)")
     _add_compat_platform_flag(gateway_restart)
 
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")

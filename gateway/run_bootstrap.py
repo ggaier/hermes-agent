@@ -319,6 +319,34 @@ async def _start_gateway_start_control_socket(runner):
                 "pausing": accepted, "already_stopping": not accepted,
                 "pid": os.getpid(), "drain_timeout": _drain}
 
+        def _restart_withdraw_approvals_handler(params: dict) -> dict:
+            accepted_box: list[bool] = []
+            _done = threading.Event()
+            withdraw_policy = bool(params.get("withdraw_approvals", True))
+
+            def _request() -> None:
+                try:
+                    accepted_box.append(
+                        runner.request_restart(
+                            detached=False,
+                            via_service=True,
+                            withdraw_approvals=withdraw_policy,
+                        )
+                    )
+                finally:
+                    _done.set()
+
+            _main_loop.call_soon_threadsafe(_request)
+            _done.wait(timeout=5.0)
+            accepted = bool(accepted_box and accepted_box[0])
+            policy_name = params.get("policy") or ("withdraw_approvals" if withdraw_policy else "default")
+            return {
+                "pid": os.getpid(),
+                "accepted": accepted,
+                "policy": policy_name,
+                "withdraw_approvals": withdraw_policy,
+            }
+
         def _rescan_profiles_handler() -> dict:
             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now
             (the watcher also rescans periodically). Runs on the socket executor: marshal onto the loop
@@ -336,6 +364,7 @@ async def _start_gateway_start_control_socket(runner):
 
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler, "identify": _identify_runtime,
+                           "restart-withdraw-approvals": _restart_withdraw_approvals_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "unserve-profile": unserve_profile_verb(runner),

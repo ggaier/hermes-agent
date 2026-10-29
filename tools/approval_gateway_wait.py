@@ -131,9 +131,12 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     state = _poll_event(leader.event, session_key,
                         interrupt_log="Coalesced approval wait interrupted — "
                                       "returning deny for session %s")
+    withdrawn_cause = getattr(leader, "cancelled", None)
     if state == "set" and leader.result is None and leader.expired:
         state = "timeout"
     cancelled = _cancel_cause(state, leader)
+    if state == "timeout" and withdrawn_cause:
+        cancelled = withdrawn_cause
     if state == "interrupted":
         # Deny only OUR follower; the leader thread handles its own signal.
         choice, resolved = "deny", True
@@ -189,7 +192,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     while True:
         cancelled = None
         with _approval._lock:
-            if isinstance(notify_cb, _GatewayNotify):
+            if getattr(_approval, "_approval_admission_closed", False):
+                cancelled = getattr(_approval, "_approval_admission_cause", None) or "the gateway restarted while this approval was pending"
+            elif isinstance(notify_cb, _GatewayNotify):
                 cancelled = notify_cb.cancelled
                 if _approval._gateway_notify_cbs.get(session_key) is not notify_cb:
                     cancelled = cancelled or "the turn ended before the prompt was answered"

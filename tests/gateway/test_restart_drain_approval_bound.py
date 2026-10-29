@@ -24,6 +24,8 @@ KEY = "discord:restart-bound"
 
 
 def _reset():
+    if hasattr(approval_mod, "reset_approval_admission_for_tests"):
+        approval_mod.reset_approval_admission_for_tests()
     with approval_mod._lock:
         approval_mod._gateway_queues.pop(KEY, None)
 
@@ -60,6 +62,7 @@ async def test_restart_wait_does_not_sit_out_the_cap_behind_an_approval():
     thread, result, settled = _start_waiter()
     runner._active_work_count = lambda: 1 if thread.is_alive() else 0
     runner._running_agent_count = runner._active_work_count
+    runner.request_restart(withdraw_approvals=True)
     loop = asyncio.get_running_loop()
     begun = loop.time()
     try:
@@ -88,10 +91,13 @@ async def test_after_a_withdrawn_approval_the_session_is_not_wedged():
     thread, _result, _settled = _start_waiter()
     runner._active_work_count = lambda: 1 if thread.is_alive() else 0
     runner._running_agent_count = runner._active_work_count
+    runner.request_restart(withdraw_approvals=True)
     try:
         await asyncio.wait_for(runner._await_active_work_before_restart(), timeout=20)
         thread.join(2.0)
         assert not thread.is_alive()
+        # The replacement process starts with a fresh fence (simulated via reset):
+        approval_mod.reset_approval_admission_for_tests()
         # The queue is empty again: a later request in the same session is admitted, not blocked
         # behind the dead prompt.
         later = {}

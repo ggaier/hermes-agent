@@ -121,6 +121,8 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_approval_admission_closed: bool = False
+_approval_admission_cause: str | None = None
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -194,6 +196,49 @@ def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> 
         entry.expired = cause == "timeout"
         entry.event.set()
     return True
+
+
+def begin_approval_withdrawal(cause: str) -> int:
+    """Close admission for new approvals in this process and withdraw all currently pending ones.
+
+    Sets a process-lifetime ADMISSION-CLOSED fence under ``_lock``, waking all pending waiters
+    fail-closed with ``cancelled=cause``, ``expired=True``, and ``event.set()``. Any subsequent
+    approval registration or enqueue in this process fails immediately with the same cause.
+    """
+    global _approval_admission_closed, _approval_admission_cause
+    with _lock:
+        _approval_admission_closed = True
+        _approval_admission_cause = cause
+        queues = list(_gateway_queues.items())
+        total = 0
+        for _session_key, queue in queues:
+            for entry in list(queue):
+                entry.cancelled = cause
+                entry.expired = True
+                entry.event.set()
+                total += 1
+        _gateway_queues.clear()
+    return total
+
+
+def is_approval_admission_closed() -> bool:
+    """Return True if approval admission has been closed in this process."""
+    with _lock:
+        return _approval_admission_closed
+
+
+def get_approval_admission_cause() -> str | None:
+    """Return the withdrawal cause if approval admission is closed."""
+    with _lock:
+        return _approval_admission_cause
+
+
+def reset_approval_admission_for_tests() -> None:
+    """Explicitly reset the admission-closed fence for test isolation only."""
+    global _approval_admission_closed, _approval_admission_cause
+    with _lock:
+        _approval_admission_closed = False
+        _approval_admission_cause = None
 
 
 def withdraw_all_gateway_approvals(cause: str) -> int:
