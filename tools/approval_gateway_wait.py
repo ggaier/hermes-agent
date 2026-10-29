@@ -237,18 +237,23 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
 
         state = _poll_event(entry.event, session_key,
                             interrupt_log="Approval wait interrupted — returning deny for session %s")
+        # The surface withdrew this prompt because ITS window expired: the wait is over, and it is a
+        # timeout (no choice, fail-closed) — not a resolved approval nor a silent session teardown.
+        expired_prompt = state == "set" and entry.result is None and entry.expired
         cancelled = _cancel_cause(state, entry)
         if state == "interrupted":
             # Coalesced followers wake with the cause instead of a deny nobody issued.
             entry.cancelled = cancelled
             entry.event.set()
-        choice = _drop_entry(state)
+        choice = _drop_entry("timeout" if expired_prompt else state)
         if state == "interrupted":
             # Our own decision stays a fail-closed deny.
             choice = "deny"
         # A choice that landed in the gap between the deadline check and leaving the queue is an answer,
         # not a timeout (#112548) — the same first-settlement rule as server_requests.send().
         resolved = state != "timeout" or choice is not None
+        if expired_prompt:
+            resolved = False
         extra = {"cancelled": cancelled} if cancelled else {}
         human.outcome = _hook_choice(resolved, choice, extra)
         return _finish(payload, resolved, choice, entry.reason, **extra)

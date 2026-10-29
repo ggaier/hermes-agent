@@ -189,6 +189,9 @@ def withdraw_gateway_approval(session_key: str, request_id: str, cause: str) -> 
         if not queue:
             _gateway_queues.pop(session_key, None)
         entry.cancelled = cause
+        # A surface expiry IS the wait's timeout: flag it so the waiter reports "timeout" (and the
+        # honest timeout notice posts) instead of looking like a silent session teardown.
+        entry.expired = cause == "timeout"
         entry.event.set()
     return True
 

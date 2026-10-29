@@ -5744,6 +5744,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 allowed_role_ids=self._allowed_role_ids, require_admin=require_admin,
                 admin_user_ids=admin_user_ids, allow_permanent="always" in choices,
                 allow_session="session" in choices, smart_denied=prompt.smart_denied,
+                request_id=getattr(prompt, "request_id", None),
             )
             send_kwargs: dict[str, Any] = {"content": content, "embed": embed, "view": view}
             if mention_content:
@@ -6469,9 +6470,13 @@ def _define_discord_view_classes() -> None:
             self, session_key: str, allowed_user_ids: set, allowed_role_ids: Optional[set] = None,
             require_admin: bool = False, admin_user_ids: Optional[set] = None,
             allow_permanent: bool = True, allow_session: bool = True, smart_denied: bool = False,
+            request_id: Optional[str] = None,
         ):
             super().__init__(allowed_user_ids, allowed_role_ids, timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
+            # Exact approval request this card belongs to. Without it a click can only mean "oldest",
+            # which lets a stale card settle a newer queued command, and expiry cannot end the wait.
+            self.request_id = request_id
             self.require_admin = require_admin
             self.admin_user_ids = {str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()}
             self._localize_buttons(
@@ -6482,6 +6487,22 @@ def _define_discord_view_classes() -> None:
                 self.remove_item(self.allow_always)
             elif not allow_permanent:
                 self.remove_item(self.allow_always)
+
+        async def on_timeout(self):
+            """The card expired: fail-closed AND end the backend wait for THIS request.
+
+            The inherited behaviour only greys the card; the backend ``_poll_event`` then kept
+            waiting ``approvals.timeout`` (86400s in production) for an answer nobody could give,
+            which is what left three threads "running" for hours behind expired cards.
+            """
+            await super().on_timeout()
+            if not self.request_id:
+                return
+            try:
+                from tools.approval import withdraw_gateway_approval
+                withdraw_gateway_approval(self.session_key, self.request_id, "timeout")
+            except Exception as exc:  # never let a UI callback raise into discord.py
+                logger.warning("[Discord] approval withdraw on timeout failed: %s", exc)
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Base admission always required; with ``require_admin`` the clicker must
@@ -6520,7 +6541,7 @@ def _define_discord_view_classes() -> None:
             # wait timed out (count == 0) must not claim "Approved".
             try:
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
+                count = resolve_gateway_approval(self.session_key, choice, request_id=self.request_id)
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,
