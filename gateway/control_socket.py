@@ -172,8 +172,16 @@ def build_identify_payload() -> dict[str, Any]:
 def build_status_payload() -> dict[str, Any]:
     """Default ``status`` answer — current runtime status, answered live."""
     from gateway.status import read_runtime_status
-    return {**(read_runtime_status() or {}), "protocol": CONTROL_PROTOCOL_VERSION,
-            "answered_at": time.time(), "answering_pid": os.getpid()}
+    payload = {**(read_runtime_status() or {}), "protocol": CONTROL_PROTOCOL_VERSION,
+               "answered_at": time.time(), "answering_pid": os.getpid()}
+    # Diagnostic only: a count, never command or session text. None (unknown) when the queue can't be
+    # read — a watchdog must not read a failed probe as "no approval is waiting".
+    try:
+        from tools.approval import pending_gateway_approval_count
+        payload["pending_approvals"] = max(0, int(pending_gateway_approval_count()))
+    except Exception:
+        payload["pending_approvals"] = None
+    return payload
 
 
 class GatewayControlServer:

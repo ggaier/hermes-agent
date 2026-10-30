@@ -110,6 +110,12 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Provable refusal: the ingress gates dropped this event before ANY consumer could take it
+    # (no handler, unusable identity, unauthorized sender, bot-loop budget, drain notice, full
+    # queue). Its absence together with ``_gateway_accepted`` marks the outcome UNKNOWN — the
+    # event may have been consumed on a path that left no receipt — so a caller that must decide
+    # whether to re-run an input fails closed instead of assuming "not delivered".
+    _gateway_refused: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 

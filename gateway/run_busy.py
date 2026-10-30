@@ -502,6 +502,8 @@ class GatewayBusySessionMixin:
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
+            # The cap refused it: nothing owns this text, so it stays provably retryable.
+            event._gateway_refused = True
             return
 
         self._enqueue_fifo(session_key, event, adapter)
@@ -708,6 +710,12 @@ class GatewayBusySessionMixin:
             redirected = self._redirect_active_turn(
                 running_agent, (event.text or "").strip(), session_key, event
             )
+        if steered or redirected:
+            # Admission receipt: the text is INSIDE the running turn now (injected and, for a
+            # redirect, answered with this message as the anchor). A caller that reads the event as
+            # undelivered would run an instruction twice — the production #39 N3 defect, where the
+            # backfill re-queued a redirect the user had already seen executed.
+            event._gateway_accepted = True
         return self._BusySteerOutcome(
             effective_mode=effective_mode, demoted_for_subagents=demoted_for_subagents,
             demoted_for_compression=demoted_for_compression, steered=steered, redirected=redirected,
@@ -904,15 +912,20 @@ class GatewayBusySessionMixin:
                 "user=%s (%s), platform=%s, session=%s", event.source.user_id, event.source.user_name,
                 event.source.platform.value if event.source.platform else "unknown", session_key,
             )
+            event._gateway_refused = True
             return True  # handled (silently dropped); do not fall through
         # A steered or queued follow-up never reaches _hm_admit_event, so the budget is charged here.
         if not self._admit_bot_message_for_source(event.source):
+            event._gateway_refused = True
             return True
         event._bot_loop_admitted = True
 
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)
+            # Queued-during-drain stamps its own receipt; a rejected follow-up did not run.
+            if not event._gateway_accepted:
+                event._gateway_refused = True
             return True
         if await self._route_plaintext_approval_while_busy(event, session_key):
             return True

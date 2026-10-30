@@ -3997,9 +3997,11 @@ class BasePlatformAdapter(ABC):
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
         event._gateway_accepted = False
+        event._gateway_refused = False
         if not self._message_handler:
             # No handler = every inbound silently discarded on an adapter that still polls and sends;
             # say so once per adapter (#102260).
+            event._gateway_refused = True
             if not getattr(self, "_no_message_handler_logged", False):
                 self._no_message_handler_logged = True
                 logger.error(
@@ -4014,6 +4016,7 @@ class BasePlatformAdapter(ABC):
             coerce_plaintext_gateway_command(event)
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
+            event._gateway_refused = True
             return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
@@ -4025,6 +4028,7 @@ class BasePlatformAdapter(ABC):
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
+            event._gateway_refused = True
             return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
@@ -4080,6 +4084,11 @@ class BasePlatformAdapter(ABC):
         cmd = event.get_command()
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
         if should_bypass_active_session(cmd):
+            # Admission receipt BEFORE the inline side effect: this branch consumes the event (the
+            # handler runs here, not in a session turn), so a caller holding the event must not read
+            # it as undelivered and re-run a control command that already executed — a recovered
+            # /approve that raised mid-way still counts as consumed. See #39 F2.
+            event._gateway_accepted = True
             try:
                 # /stop, /new, /reset: cancel + response + drain; other bypasses don't cancel.
                 if cmd and is_interrupt_then_dispatch(cmd):
@@ -4107,6 +4116,10 @@ class BasePlatformAdapter(ABC):
                 _has_text_clarify = False
             if _has_text_clarify:
                 logger.debug("[%s] Routing message to clarify text-intercept for %s", self.name, session_key)
+                # Receipt BEFORE the dispatch: the clarify resolver consumes the answer here (it
+                # never becomes a turn), so an event that raised mid-resolution still counts as
+                # consumed and must not be replayed as a fresh user message. See #39 N3.
+                event._gateway_accepted = True
                 try:
                     await self._dispatch_inline_reply(event)
                 except Exception as e:
@@ -4141,6 +4154,10 @@ class BasePlatformAdapter(ABC):
                     event._gateway_accepted = self._start_session_processing(event, session_key)
                     return
             if handled:
+                # "Handled" is not "consumed": the handler stamps the receipt on the branches that
+                # took the event (queued, steered, redirected, approval executed) and the refusal
+                # marker on the ones that dropped it (unauthorized, bot-loop budget, drain). An
+                # event with neither is UNKNOWN, and must never be read as "not delivered".
                 return
         # Without a runner FIFO, do not merge a wake into an occupied human slot
         # (or collapse distinct wakes into one turn). Its caller can retry admission.
@@ -4157,6 +4174,10 @@ class BasePlatformAdapter(ABC):
                          "debouncing follow-up (busy_text_mode=queue, window=%.2fs)", self.name,
                          session_key, self._busy_text_debounce_seconds)
             await self._queue_text_debounce(session_key, event)
+            # The buffer (or the pending slot it just merged into) now owns this text and the next
+            # drain runs it. Without the receipt a caller reading "not accepted" re-runs an input
+            # the debounce already took — and nothing drains a buffer no turn owns. See #39 N3.
+            event._gateway_accepted = True
         else:
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)

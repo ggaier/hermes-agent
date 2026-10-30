@@ -273,8 +273,8 @@ async def test_recovered_mention_reuses_live_auth_and_mention_gates(adapter, mon
         lambda user_id, *_a, **_kw: user_id == str(allowed.author.id),
     )
 
-    assert await adapter._dispatch_recovered_message(denied) is False
-    assert await adapter._dispatch_recovered_message(allowed) is True
+    assert (await adapter._dispatch_recovered_message(denied)).accepted is False
+    assert (await adapter._dispatch_recovered_message(allowed)).accepted is True
     adapter._handle_message.assert_awaited_once_with(
         allowed,
         role_authorized=False,
@@ -527,9 +527,9 @@ async def test_redispatch_of_one_message_is_bounded(adapter, monkeypatch):
         await adapter._run_missed_message_backfill()
     assert adapter._handle_message.await_count == 1  # active claim survives the scan's 'discovered' write
 
-    # Claim expired (turn died): the lifetime cap still bounds total re-dispatch.
+    # Claim expired without ever being admitted: the lifetime cap still bounds total re-dispatch.
     def _expire(conn):
-        conn.execute("UPDATE discord_messages SET status='failed' WHERE message_id='95'")
+        conn.execute("UPDATE discord_messages SET status='unadmitted' WHERE message_id='95'")
     adapter._with_discord_recovery_db(_expire)
     adapter._handle_message = AsyncMock(return_value=True)
     for _ in range(4):
@@ -565,8 +565,10 @@ async def test_stored_cursor_cannot_widen_scan_window_or_leak_into_threads(adapt
     assert channel.seen_after == [window_floor]  # stale cursor ignored
     assert thread.seen_after == [window_floor]  # parent's cursor not inherited
 
+    # Superseded by #39: the completed cursor is no longer a candidate floor at all. A high-id
+    # completion must not hide older unprocessed ids, so even a fresh cursor leaves the window floor.
     adapter._advance_discord_recovery_cursor("123", str(fresh_cursor))
     async for _ in adapter._iter_channel_and_thread_messages(channel, limit=10, after=window_floor, seen_channels=set()):
         pass
-    assert not isinstance(channel.seen_after[-1], dt.datetime)  # newer cursor narrows (discord.Object)
+    assert channel.seen_after[-1] == window_floor
     assert thread.seen_after[-1] == window_floor

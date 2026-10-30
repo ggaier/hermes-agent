@@ -62,18 +62,31 @@ class DiscordRecoveryStore:
                 replied INTEGER NOT NULL DEFAULT 0, emoji_ack INTEGER NOT NULL DEFAULT 0,
                 outage_response INTEGER NOT NULL DEFAULT 0, response_message_id TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0, last_attempt_at TEXT, last_error TEXT,
+                claim_owner TEXT,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS discord_recovery_scans (
                 scan_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL,
                 channels TEXT NOT NULL, window_seconds REAL NOT NULL, limit_count INTEGER NOT NULL,
                 scanned INTEGER NOT NULL DEFAULT 0, missed INTEGER NOT NULL DEFAULT 0,
-                dispatched INTEGER NOT NULL DEFAULT 0, error TEXT
+                dispatched INTEGER NOT NULL DEFAULT 0, pending_retry INTEGER NOT NULL DEFAULT 0,
+                error TEXT
             );
             CREATE TABLE IF NOT EXISTS discord_recovery_cursors (
                 channel_id TEXT PRIMARY KEY, last_message_id TEXT NOT NULL, updated_at TEXT NOT NULL
             );
         """)
+        # Ledgers written before recovery claims were owned still work: the column is additive and
+        # every writer names it, so only pre-existing profiles need the one-time ALTER.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(discord_messages)")}
+        if "claim_owner" not in columns:
+            conn.execute("ALTER TABLE discord_messages ADD COLUMN claim_owner TEXT")
+        # Retry debt a scan leaves behind (#39 N3): a run that recorded retryable rows must not
+        # read as a clean sweep in the ledger.
+        scan_columns = {row[1] for row in conn.execute("PRAGMA table_info(discord_recovery_scans)")}
+        if "pending_retry" not in scan_columns:
+            conn.execute(
+                "ALTER TABLE discord_recovery_scans ADD COLUMN pending_retry INTEGER NOT NULL DEFAULT 0")
         cutoff = (dt.datetime.now(dt.UTC) - dt.timedelta(days=_RETENTION_DAYS)).isoformat()
         conn.execute("DELETE FROM discord_messages WHERE updated_at < ?", (cutoff,))
         conn.execute("DELETE FROM discord_recovery_scans WHERE COALESCE(completed_at, started_at) < ?", (cutoff,))

@@ -119,6 +119,12 @@ class GatewayStartupMixin:
         if queue is None:
             queue = self._startup_restore_queue = []
         queue.append(event)
+        # The gate owns delivery from here: the drain replays this event exactly once, so the
+        # caller holding it must read it as delivered. Without this a recovery dispatch settles
+        # the row as "no consumer" (retryable ``unadmitted``) while its turn is about to run.
+        # Same convention as the busy FIFO (_enqueue_fifo); handle_message() resets the flag when
+        # the replay starts, so a drain that drops the event does not leave it looking delivered.
+        event._gateway_accepted = True
         with suppress(Exception):
             source = event.source
             logger.info(

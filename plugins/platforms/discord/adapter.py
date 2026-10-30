@@ -12,6 +12,7 @@ Uses discord.py library for:
 
 import asyncio
 import datetime as dt
+import errno
 import hashlib
 import inspect
 import json
@@ -27,6 +28,7 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import nullcontext, suppress
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
 
@@ -89,6 +91,32 @@ _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+# Row states a reconnect scan may still legitimately act on: 'discovered' (the scan saw the row) and
+# 'unadmitted' (a settled admission refusal). Everything else is a live consumer's claim
+# (queued/processing) or a terminal (responded/cancelled/failed/unknown). Read by the replay guard
+# and enforced by the ledger writers themselves, so the two can never drift apart.
+_DISCORD_RETRYABLE_STATUSES = frozenset({"discovered", "unadmitted"})
+
+
+@dataclass(frozen=True)
+class _RecoveryReceipt:
+    """What one recovery dispatch proved about the message (#39 N3).
+
+    ``accepted`` — a consumer took it (turn admitted, queued, steered or redirected).
+    ``refused``  — an ingress gate provably dropped it before any consumer saw it.
+    Neither      — UNKNOWN: it may have been consumed without stamping a receipt (the busy path
+                   before this fix). Recovery settles that as in-flight and never retries it.
+    """
+
+    accepted: bool
+    refused: bool = False
+
+    @property
+    def unknown(self) -> bool:
+        return not self.accepted and not self.refused
+# Distinct from a ledger answer of "no row/unanswered": the store returns this only when the read
+# itself failed, which live ingress must treat as fail-open instead of "drop the message".
+_LEDGER_UNREAD = object()
 # Discord caps global slash commands at 100/app; exceeding it fails the ENTIRE sync (error 30032).
 _DISCORD_MAX_APP_COMMANDS = 100
 # Native slash commands (registered before COMMAND_REGISTRY/plugins so they survive the 100 cap):
@@ -379,6 +407,54 @@ def _abort_discord_websocket_transport(websocket: Any) -> bool:
     return True
 
 
+_CONNECT_TIMEOUT_TYPE_NAMES = frozenset({
+    "ServerTimeoutError", "ConnectionTimeoutError", "SocketTimeoutError",
+})
+
+
+def _connect_exception_chain(error: BaseException):
+    """Yield the exception and everything linked to it (``__cause__``/``__context__``/aiohttp
+    ``os_error``), cycle-safe. Classification reads this structure, never the message text."""
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if item is None or id(item) in seen:
+            continue
+        seen.add(id(item))
+        yield item
+        pending.extend((
+            getattr(item, "__cause__", None),
+            getattr(item, "__context__", None),
+            getattr(item, "os_error", None),
+        ))
+
+
+def _is_proxy_exception(error: BaseException) -> bool:
+    """True only for aiohttp's typed proxy connector error (class name covers mocked/absent aiohttp)."""
+    if error.__class__.__name__ == "ClientProxyConnectionError":
+        return True
+    try:
+        import aiohttp
+        return isinstance(error, aiohttp.ClientProxyConnectionError)
+    except Exception:
+        return False
+
+
+def _is_network_timeout(error: BaseException) -> bool:
+    """Provable transport timeout: an aiohttp timeout type or an ETIMEDOUT in the chain.
+
+    A bare ``TimeoutError`` from our own READY deadline is deliberately NOT a network timeout —
+    the caller knows which wait it bounded and keeps ``discord_connect_timeout`` for it.
+    """
+    for item in _connect_exception_chain(error):
+        if item.__class__.__name__ in _CONNECT_TIMEOUT_TYPE_NAMES:
+            return True
+        if isinstance(item, OSError) and getattr(item, "errno", None) == errno.ETIMEDOUT:
+            return True
+    return False
+
+
 async def _wait_for_ready_or_bot_exit(
     ready_event: asyncio.Event, bot_task: asyncio.Task, timeout: Optional[float],
 ) -> None:
@@ -550,11 +626,6 @@ class _DiscordNonConversationalMessageTracker:
 
     def __contains__(self, message_id: str) -> bool:
         return str(message_id or "") in self._ids
-
-
-def _discord_snowflake_time(snowflake: int) -> dt.datetime:
-    """UTC creation time encoded in a Discord snowflake (ms since 2015-01-01 in the top 42 bits)."""
-    return dt.datetime.fromtimestamp(((snowflake >> 22) + 1420070400000) / 1000, tz=dt.UTC)
 
 
 def _metadata_marks_nonconversational(metadata: Optional[dict[str, Any]]) -> bool:
@@ -1515,6 +1586,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     adapter_self._ensure_missed_message_backfill_task()
 
             @self._client.event
+            async def on_resumed():
+                logger.info("[%s] Discord session resumed", adapter_self.name)
+                if adapter_self._missed_message_backfill_enabled():
+                    adapter_self._ensure_missed_message_backfill_task()
+
+            @self._client.event
             async def on_socket_event_type(event_type: str):
                 # Dispatch-side liveness stamp (#109521 incident 2): an ESTAB socket can keep
                 # ACKing heartbeats (op 11, no event type) while zero DISPATCH events are parsed,
@@ -1613,16 +1690,23 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             # Plugin-registered native handlers (discord.py Bot — add_listener()/event hooks).
             self._wire_plugin_handlers(self._client)
             return True
-        except TimeoutError:
+        except TimeoutError as error:
             logger.error("[%s] Timeout waiting for connection to Discord", self.name, exc_info=True)
             # Cancel the bot task so a discarded adapter can't fire on_message (two clients answering).
             await self._cancel_bot_task()
             self._release_platform_lock()
             # Always set an explicit fatal code: a code-less failure makes the gateway guess "transient".
-            self._set_fatal_error(
-                "discord_connect_timeout",
-                "Timed out waiting for the Discord gateway to become ready", retryable=True,
-            )
+            if _is_network_timeout(error):
+                # Transport timeout: diagnostic only. A watchdog restart cannot fix a dead uplink.
+                self._set_fatal_error(
+                    "discord_network_timeout",
+                    "Timed out reaching Discord over the network", retryable=True,
+                )
+            else:
+                self._set_fatal_error(
+                    "discord_connect_timeout",
+                    "Timed out waiting for the Discord gateway to become ready", retryable=True,
+                )
             return False
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to connect to Discord: %s", self.name, e, exc_info=True)
@@ -1666,6 +1750,35 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 )
             )
             return ("discord_intents_required", guidance, False)
+        # Proxy refusal is narrower than "connection refused": it needs aiohttp's typed proxy error
+        # AND ECONNREFUSED in the chain. A plain ConnectionRefusedError (shared uplink) must never be
+        # reported as a proxy problem, and a typed proxy error with any other errno is not a refusal.
+        chain = list(_connect_exception_chain(error))
+        proxy = any(_is_proxy_exception(item) for item in chain)
+        refused = any(isinstance(item, OSError)
+                      and getattr(item, "errno", None) == errno.ECONNREFUSED for item in chain)
+        if proxy and refused:
+            return (
+                "discord_proxy_refused",
+                "Discord could not reach the configured proxy: the proxy port refused the "
+                "connection. Fix the proxy listener/configuration — restarting the gateway "
+                "does not open a closed proxy port.",
+                True,
+            )
+        if _is_network_timeout(error):
+            return (
+                "discord_network_timeout",
+                "Timed out reaching Discord over the network (transport timeout).",
+                True,
+            )
+        if proxy:
+            # Keep proxy endpoints/credentials out of the diagnostic even for an unclassified
+            # proxy-typed failure: never interpolate the exception text here.
+            return (
+                "discord_connect_error",
+                "Discord startup failed while using a proxy (endpoint details withheld).",
+                True,
+            )
         return ("discord_connect_error", f"Discord startup failed: {error}", True)
 
     def _discord_message_admission(self, message: Any, *, claim: bool) -> tuple[bool, bool]:
@@ -1756,6 +1869,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except TimeoutError:
                 pass
+        # Durable replay fence BEFORE the TTL dedup: a resumed session replays MESSAGE_CREATE,
+        # and the in-memory table is empty in a fresh process.
+        if await self._discord_ledger_says_answered(message):
+            return False
         admitted, role_authorized = self._discord_message_admission(message, claim=True)
         if not admitted:
             return False
@@ -2481,8 +2598,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             tasks.append(task)
         return task
 
-    async def _finish_recovery_scan(self, scan_id: str, status: str, counts: dict, error: Optional[str] = None) -> None:
-        await asyncio.to_thread(self._record_recovery_scan_complete, scan_id, status=status, error=error, **counts)
+    async def _finish_recovery_scan(
+        self, scan_id: str, status: str, counts: dict, *, pending_retry: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._record_recovery_scan_complete, scan_id, status=status,
+            pending_retry=pending_retry, error=error, **counts,
+        )
 
     async def _run_missed_message_backfill(self) -> None:
         """Enqueue recent Discord messages missed while the bot was down: Gateway events aren't
@@ -2500,12 +2623,20 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             )
             return
         scan_id = await asyncio.to_thread(self._record_recovery_scan_start, channels)
+        # Coverage gaps found while scanning (unreadable history/thread listing) must reach the ledger:
+        # swallowing them and finishing "success" reports a scan that never saw the channel's messages.
+        scan_errors: list[str] = []
+        self._recovery_scan_errors = scan_errors
         if not channels:
             logger.info("[%s] Missed-message backfill enabled but no channels configured", self.name)
             await self._finish_recovery_scan(scan_id, "skipped", dict(scanned=0, missed=0, dispatched=0))
+            self._recovery_scan_errors = None
             return
         max_dispatches = self._missed_message_backfill_max_dispatches()
         counts = dict(scanned=0, missed=0, dispatched=0)
+        # Rows this scan leaves retryable: they are NOT delivered and the next reconnect is their
+        # only retry. Recorded so a run that owes messages never reads as a clean sweep (#39 N3).
+        pending_retry = 0
         try:
             async for message in self._iter_missed_message_backfill_candidates(channels):
                 counts["scanned"] += 1
@@ -2522,25 +2653,76 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     getattr(message, "id", "unknown"),
                     getattr(getattr(message, "channel", None), "id", "unknown"),
                 )
-                self._record_recovery_attempt(message, status="queued")
+                # Only a *durable* claim may be dispatched: the queued transition is the proof
+                # that this scan owns the row. A refused write (ledger error) or a row a live
+                # consumer already claimed is not ours, so nothing runs and nothing is settled.
+                claim_owner = f"scan:{scan_id}"
+                if not self._record_recovery_attempt(message, status="queued", owner=claim_owner):
+                    logger.info(
+                        "[%s] Not dispatching Discord message %s: no durable recovery claim "
+                        "(ledger write failed or another consumer owns the row)",
+                        self.name, message_id,
+                    )
+                    continue
                 try:
-                    admitted = await self._dispatch_recovered_message(message)
+                    receipt = await self._dispatch_recovered_message(message)
+                    admitted = receipt.accepted
                     if admitted:
+                        # A consumer owns the row now (gateway admitted the turn, or the startup
+                        # restore gate queued it): settle it as in-flight. Leaving the scan's
+                        # ``queued`` claim here reads as in-flight but still carries the scanner's
+                        # owner token, and treating it as "no consumer" is what wrote the false
+                        # retryable ``unadmitted`` in production.
+                        self._record_recovery_attempt(
+                            message, status="processing", owner=claim_owner)
                         counts["dispatched"] += 1
+                    elif receipt.refused:
+                        # Provably never consumed (no handler, unauthorized, drain, queue cap): the
+                        # only honest state is retryable, and the debt is visible in the scan.
+                        self._record_recovery_attempt(
+                            message, status="unadmitted", owner=claim_owner)
+                        pending_retry += 1
+                        logger.warning(
+                            "[%s] Recovery dispatch was not admitted for Discord message %s "
+                            "(ingress refused it before any consumer); left retryable",
+                            self.name, message_id,
+                        )
+                    else:
+                        # Consumed on a path that left no receipt, or blocked behind a busy turn
+                        # that will answer it later. Recovery CANNOT prove this input did not run,
+                        # so it must fail closed: settle as in-flight, never retryable. Writing a
+                        # retryable row here is the production N3 defect (an already-redirected
+                        # message was handed back to the retry pool).
+                        self._record_recovery_attempt(
+                            message, status="processing", owner=claim_owner)
+                        counts["dispatched"] += 1
+                        logger.info(
+                            "[%s] Recovery dispatch for Discord message %s produced no receipt but "
+                            "was not provably refused; settling as in-flight (never retried)",
+                            self.name, message_id,
+                        )
                 except asyncio.CancelledError:
-                    self._dedup.discard(message_id)
-                    self._record_recovery_attempt(message, status="cancelled")
+                    self._release_recovery_dedup_claim(message_id, claim_owner)
+                    self._record_recovery_attempt(
+                        message, status="cancelled", owner=claim_owner)
                     raise
                 except Exception as exc:
-                    self._dedup.discard(message_id)
-                    self._record_recovery_attempt(message, status="failed", error=str(exc))
+                    self._release_recovery_dedup_claim(message_id, claim_owner)
+                    self._record_recovery_attempt(
+                        message, status="failed", error=str(exc), owner=claim_owner)
                     raise
                 if counts["dispatched"] >= max_dispatches:
                     break
-            await self._finish_recovery_scan(scan_id, "success", counts)
+            await self._finish_recovery_scan(
+                scan_id, "partial" if (scan_errors or pending_retry) else "success", counts,
+                pending_retry=pending_retry,
+                error="; ".join(scan_errors[:5]) if scan_errors else None,
+            )
             logger.info(
-                "[%s] Missed-message backfill complete: scanned=%d missed=%d dispatched=%d",
+                "[%s] Missed-message backfill complete: scanned=%d missed=%d dispatched=%d "
+                "pending_retry=%d coverage_gaps=%d",
                 self.name, counts["scanned"], counts["missed"], counts["dispatched"],
+                pending_retry, len(scan_errors),
             )
         except asyncio.CancelledError:
             await self._finish_recovery_scan(scan_id, "cancelled", counts)
@@ -2548,6 +2730,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         except Exception as exc:  # pragma: no cover - defensive logging
             await self._finish_recovery_scan(scan_id, "failed", counts, error=str(exc))
             logger.warning("[%s] Missed-message backfill failed: %s", self.name, exc, exc_info=True)
+        finally:
+            # Per-scan buffer: never leak one scan's gaps into the next adapter-wide observation.
+            self._recovery_scan_errors = None
 
     def _in_bot_thread(self, message: Any) -> bool:
         """Thread the bot already joined skips the mention check — unless
@@ -2558,7 +2743,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             and not self._discord_thread_require_mention()
         )
 
-    async def _dispatch_recovered_message(self, message: Any) -> bool:
+    async def _dispatch_recovered_message(self, message: Any) -> _RecoveryReceipt:
         """Run one recovered message through the live Discord ingress gates."""
         if not isinstance(message.channel, discord.DMChannel):
             parent_id = self._get_parent_channel_id(message.channel)
@@ -2571,11 +2756,64 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 and not self._in_bot_thread(message)
                 and not self._self_is_explicitly_mentioned(message)
             ):
-                return False
-        admitted, role_authorized = self._discord_message_admission(message, claim=False)
+                # Not addressed to Hermes: provably nothing will consume it, so it is a refusal —
+                # and it must be a RECEIPT, not a bare bool. Returning bool here crashed the scan
+                # on `receipt.accepted` for every un-addressed candidate (#39 N5).
+                return _RecoveryReceipt(accepted=False, refused=True)
+        # Claim here, not in the scan loop: the scan must keep inspecting a message a live event is
+        # already handling, but the moment recovery decides to run one it owns the id, so a resumed
+        # session replaying the same MESSAGE_CREATE cannot execute the turn twice.
+        admitted, role_authorized = self._discord_message_admission(message, claim=True)
         if not admitted:
-            return False
-        return await self._handle_message(message, role_authorized=role_authorized, recovered=True)
+            return _RecoveryReceipt(accepted=False, refused=True)
+        # The receipt must travel out of band: discord.Message defines __slots__, so stamping an
+        # attribute on it raises AttributeError in production (it worked only against
+        # SimpleNamespace test doubles). #39 N5.
+        message_id = str(getattr(message, "id", ""))
+        self._clear_recovery_receipt(message_id)
+        accepted = await self._handle_message(message, role_authorized=role_authorized, recovered=True)
+        outcome = self._take_recovery_receipt(message_id)
+        if not accepted:
+            if outcome.get("refused"):
+                # Provable refusal: nothing ran, so release the claim and let the ledger retry it.
+                self._dedup.discard(str(getattr(message, "id", "")))
+            # No receipt AND no refusal = unknown: the text may already be inside a busy turn, so
+            # the claim stays (a replay cannot run it twice) and recovery must not retry it.
+        return _RecoveryReceipt(accepted=accepted, refused=bool(outcome.get("refused")))
+
+    def _note_recovery_scan_error(self, detail: str) -> None:
+        """Record a per-scan coverage gap so the ledger can report 'partial' instead of 'success'."""
+        errors = getattr(self, "_recovery_scan_errors", None)
+        if errors is not None:
+            errors.append(detail)
+        logger.warning("[%s] Missed-message recovery coverage gap: %s", self.name, detail)
+
+    # Advisory outcome of a recovered dispatch, kept on the adapter because discord.Message is a
+    # __slots__ type: assigning attributes to it raises AttributeError in production even though
+    # SimpleNamespace test doubles accept them (#39 N5). Keyed by message id, popped on read so a
+    # later dispatch of the same id can never inherit an earlier outcome, and bounded so a scan
+    # over thousands of messages cannot grow it without limit.
+    _RECOVERY_RECEIPT_LIMIT = 256
+
+    def _record_recovery_receipt(self, message_id: Any, outcome: dict) -> None:
+        store = getattr(self, "_recovery_receipts", None)
+        if store is None:
+            store = self._recovery_receipts = {}
+        key = str(message_id or "")
+        if not key:
+            return
+        if len(store) >= self._RECOVERY_RECEIPT_LIMIT:
+            store.clear()
+        store[key] = dict(outcome)
+
+    def _take_recovery_receipt(self, message_id: Any) -> dict:
+        store = getattr(self, "_recovery_receipts", None) or {}
+        return store.pop(str(message_id or ""), {}) or {}
+
+    def _clear_recovery_receipt(self, message_id: Any) -> None:
+        store = getattr(self, "_recovery_receipts", None)
+        if store is not None:
+            store.pop(str(message_id or ""), None)
 
     async def _iter_missed_message_backfill_candidates(self, channel_ids: set[str]):
         if not self._client:
@@ -2600,61 +2838,75 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                     try:
                         channel = await self._client.fetch_channel(int(channel_id))
                     except Exception as exc:
-                        logger.debug("[%s] Cannot fetch backfill channel %s: %s", self.name, channel_id, exc)
+                        self._note_recovery_scan_error(
+                            f"channel {channel_id}: {type(exc).__name__}: {exc}")
                         continue
                 candidate_channels.append(channel)
         # Obfuscated placeholders (bot lost VIEW_CHANNEL) fail every history read — drop them
         # from both the wildcard and the explicit-id branch (#90154).
         candidate_channels = [ch for ch in candidate_channels if not is_discord_channel_obfuscated(ch)]
 
-        iterators = [
-            self._iter_channel_and_thread_messages(
-                channel, limit=limit, after=after, seen_channels=seen,
-            ).__aiter__()
-            for channel in candidate_channels
-        ]
-        yielded = 0
-        while iterators and yielded < limit:
-            next_round = []
-            for iterator in iterators:
-                try:
-                    item = await iterator.__anext__()
-                except StopAsyncIteration:
-                    continue
-                yield item
-                yielded += 1
-                next_round.append(iterator)
-                if yielded >= limit:
-                    return
-            iterators = next_round
+        # The budget is global (``limit`` messages per scan, not per channel), so it must be spent
+        # on the NEWEST messages of every source, not on the oldest of the first source: a live
+        # outage message is always the newest, and an oldest-first resumable walk across sources
+        # cuts exactly that one (production N4 — the scan reported scanned=50, missed=0 and never
+        # even wrote a row for the message the user sent during the outage).
+        #
+        # Pull one source's full window (bounded by ``limit``) at a time, merge by timestamp and
+        # keep the newest ``limit``. Deliberately not streaming: correctness of the retained set
+        # is worth one bounded in-memory list per source, and the sources are the configured
+        # channels, not every channel of a guild.
+        collected: list[Any] = []
+        for channel in candidate_channels:
+            try:
+                # +1 per source: a source that is itself over budget must prove it was truncated
+                # instead of a single busy channel reporting a clean sweep of exactly ``limit``.
+                async for item in self._iter_channel_and_thread_messages(
+                    channel, limit=limit + 1, after=after, seen_channels=seen,
+                ):
+                    collected.append(item)
+            except Exception as exc:  # pragma: no cover - defensive
+                self._note_recovery_scan_error(
+                    f"history {getattr(channel, 'id', 'unknown')}: {type(exc).__name__}: {exc}")
+        # Stable oldest-first sort: newest ``limit`` survive, and equal timestamps keep source order.
+        # A message with no created_at sorts first (it is the least trustworthy candidate, not the
+        # newest), so it can never displace a real outage message.
+        _floor = dt.datetime.min.replace(tzinfo=dt.UTC)
+        collected.sort(key=lambda m: (
+            getattr(m, "created_at", None) or _floor, str(getattr(m, "id", "")),
+        ))
+        truncated = len(collected) - limit
+        if truncated > 0:
+            # A capped scan did not see everything in the window. Saying so is the only honest
+            # option: silence here is what let production read scanned=50 as a clean sweep.
+            self._note_recovery_scan_error(
+                f"truncated: kept newest {limit} of {len(collected)} candidates in the scan window")
+        for item in collected[-limit:]:
+            yield item
 
     async def _iter_channel_and_thread_messages(self, channel: Any, *, limit: int, after: Any, seen_channels: set[str]):
-        """Yield history from a channel plus active/recent archived child threads. ``after`` is the
-        scan-window floor; a stored cursor may only narrow it, never widen it, and it is never
-        inherited by child threads (each thread has its own cursor)."""
+        """Yield history from a channel plus active/recent archived child threads.
+
+        The completed-message cursor is deliberately NOT a scan bound: it only advances on
+        completed high ids, so using it as ``after`` skips older messages in the same channel that
+        were never processed. The window floor, configured channels and ``limit`` are the bounds;
+        completion/cancelled/unknown filtering happens per message in the durable ledger."""
         channel_key = str(getattr(channel, "id", ""))
         if not channel_key or channel_key in seen_channels:
             return
         seen_channels.add(channel_key)
-        channel_after = after
-        cursor = self._discord_recovery_cursor(channel_key)
-        if cursor:
-            with suppress(ValueError, TypeError):
-                cursor_id = int(cursor)
-                if not isinstance(after, dt.datetime) or _discord_snowflake_time(cursor_id) > after:
-                    channel_after = discord.Object(id=cursor_id)
         history = getattr(channel, "history", None)
         if callable(history):
             try:
                 # Fetch the latest N then restore order; oldest_first=True could starve newer work forever.
-                history_iter = history(limit=limit, after=channel_after, oldest_first=False)
+                history_iter = history(limit=limit, after=after, oldest_first=False)
                 messages = []
                 async for message in history_iter:  # type: ignore[attr-defined]
                     messages.append(message)
                 for message in reversed(messages):
                     yield message
             except Exception as exc:
-                logger.debug("[%s] Cannot read history for %s: %s", self.name, channel_key, exc)
+                self._note_recovery_scan_error(f"history {channel_key}: {type(exc).__name__}: {exc}")
         child_threads = list(getattr(channel, "threads", []) or [])
         archived_threads = getattr(channel, "archived_threads", None)
         if callable(archived_threads):
@@ -2662,25 +2914,13 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 async for thread in archived_threads(limit=limit):
                     child_threads.append(thread)
             except Exception as exc:
-                logger.debug("[%s] Cannot list archived threads for %s: %s", self.name, channel_key, exc)
+                self._note_recovery_scan_error(f"threads {channel_key}: {type(exc).__name__}: {exc}")
         for thread in child_threads:
             thread_key = str(getattr(thread, "id", ""))
             if not thread_key or thread_key in seen_channels:
                 continue
             async for message in self._iter_channel_and_thread_messages(thread, limit=limit, after=after, seen_channels=seen_channels):
                 yield message
-
-    def _discord_recovery_cursor(self, channel_id: str) -> Optional[str]:
-        if not channel_id:
-            return None
-
-        def _op(conn):
-            row = conn.execute(
-                "SELECT last_message_id FROM discord_recovery_cursors WHERE channel_id=?",
-                (channel_id,),
-            ).fetchone()
-            return str(row[0]) if row else None
-        return self._with_discord_recovery_db(_op)
 
     def _advance_discord_recovery_cursor(self, channel_id: str, message_id: str) -> None:
         if not channel_id or not message_id:
@@ -2786,54 +3026,119 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         now = self._utc_now_iso()
 
         def _op(conn):
-            existing = conn.execute(
-                "SELECT status, updated_at FROM discord_messages WHERE message_id=?", (message_id,),
-            ).fetchone()
-            # "discovered" only says the scan saw the row: it never overwrites a completed row or an
-            # in-flight claim (queued/processing) — the active-claim guard reads that status and its
-            # original updated_at, so a died dispatch still expires after the 10-minute window.
-            keep = bool(existing) and (existing[0] == "responded" or status == "discovered")
-            final_status = existing[0] if keep else status
-            updated_at = (existing[1] or now) if keep else now
-            conn.execute(
-                """
-                INSERT INTO discord_messages (message_id, channel_id, thread_id, parent_channel_id, author_id, created_at, status, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(message_id) DO UPDATE SET
+            # "discovered" only says the scan saw the row: it must never move an existing row, so the
+            # conflict is a no-op in the write itself (a live claim that landed after the scan's
+            # contains() check keeps both its status and its original updated_at). Every other
+            # caller is the live path recording its own progress, and even that never un-answers a
+            # completed row.
+            conflict = "DO NOTHING" if status == "discovered" else """
+                DO UPDATE SET
                     channel_id=excluded.channel_id,
                     thread_id=excluded.thread_id,
                     parent_channel_id=excluded.parent_channel_id,
                     author_id=excluded.author_id,
                     created_at=COALESCE(discord_messages.created_at, excluded.created_at),
-                    status=?,
+                    status=excluded.status,
+                    claim_owner=NULL,
                     updated_at=excluded.updated_at
+                WHERE discord_messages.status <> 'responded'
+            """
+            conn.execute(
+                f"""
+                INSERT INTO discord_messages (message_id, channel_id, thread_id, parent_channel_id, author_id, created_at, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) {conflict}
                 """,
-                (message_id, channel_id, thread_id, parent_id, author_id, created_text, final_status, updated_at, final_status),
+                (message_id, channel_id, thread_id, parent_id, author_id, created_text, status, now),
             )
         self._with_discord_recovery_db(_op)
 
-    def _record_recovery_attempt(self, message: Any, *, status: str, error: Optional[str] = None) -> None:
+    def _record_recovery_attempt(
+        self, message: Any, *, status: str, error: Optional[str] = None,
+        owner: Optional[str] = None,
+    ) -> bool:
+        """Write one recovery state transition; True only when the write durably applied.
+
+        The return value is a scan's execution precondition: a ``queued`` transition that did not
+        land (ledger error swallowed by the store, or a row another consumer already owns) is not
+        a claim, so nothing may be dispatched on it. ``owner`` is the scan's claim token and it is
+        recorded in the row itself: a row that merely says ``queued`` may belong to a live consumer
+        whose admission already ran, so settling requires proving the same owner still holds it.
+        """
         if not self._missed_message_backfill_enabled():
-            return
-        self._record_discord_message_seen(message, status=status)
+            return False
         message_id = str(getattr(message, "id", "") or "")
         if not message_id:
-            return
+            return False
+        channel_id, thread_id, parent_id = self._message_channel_ids(message)
+        author_id = str(getattr(getattr(message, "author", None), "id", "") or "")
+        created_at = getattr(message, "created_at", None)
+        created_text = created_at.isoformat() if hasattr(created_at, "isoformat") else None
         now = self._utc_now_iso()
         # ``attempts`` counts dispatches (the "queued" transition) so max_attempts is a ceiling on
         # how many times one message is re-run, not on how many state transitions it saw.
         dispatched = 1 if status == "queued" else 0
+        # Concurrency guard IN the write (one statement, no read-then-write the live consumer can
+        # slip through): a scanner may only claim a row that is still unstarted, and may only settle
+        # the row it claimed itself. A live turn that claimed the id first (processing/responded/…)
+        # keeps its status, attempts and timestamp — LOST RACES NEVER REWRITE THE WINNER'S ROW.
+        retryable = sorted(_DISCORD_RETRYABLE_STATUSES)
+        if status == "queued":
+            guard = f"discord_messages.status IN ({', '.join('?' * len(retryable))})"
+        elif owner:
+            guard = "discord_messages.status = 'queued' AND discord_messages.claim_owner = ?"
+        else:
+            # No ownership proof: a fresh row may be inserted, but an existing one is never moved.
+            guard = None
+        conflict = "DO NOTHING" if guard is None else f"""
+                DO UPDATE SET
+                    channel_id=excluded.channel_id,
+                    thread_id=excluded.thread_id,
+                    parent_channel_id=excluded.parent_channel_id,
+                    author_id=excluded.author_id,
+                    created_at=COALESCE(discord_messages.created_at, excluded.created_at),
+                    status=excluded.status,
+                    attempts=discord_messages.attempts + excluded.attempts,
+                    last_attempt_at=excluded.last_attempt_at,
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at,
+                    claim_owner={"NULL" if status != "queued" else "excluded.claim_owner"}
+                WHERE {guard}
+            """
+        claim_owner = owner if status == "queued" else None
+        guard_params = retryable if status == "queued" else ([owner] if owner else [])
 
         def _op(conn):
-            conn.execute(
-                """
-                UPDATE discord_messages
-                   SET status=?, attempts=attempts+?, last_attempt_at=?, last_error=?, updated_at=?
-                 WHERE message_id=?
+            cursor = conn.execute(
+                f"""
+                INSERT INTO discord_messages (message_id, channel_id, thread_id, parent_channel_id, author_id,
+                                              created_at, status, attempts, last_attempt_at, last_error,
+                                              updated_at, claim_owner)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) {conflict}
                 """,
-                (status, dispatched, now, error, now, message_id),
+                (message_id, channel_id, thread_id, parent_id, author_id, created_text, status,
+                 dispatched, now, error, now, claim_owner, *guard_params),
             )
-        self._with_discord_recovery_db(_op)
+            return cursor.rowcount > 0
+        return bool(self._with_discord_recovery_db(_op, default=False))
+
+    def _release_recovery_dedup_claim(self, message_id: str, owner: str) -> None:
+        """Drop the in-memory dedup claim only while this scan still owns the ledger row.
+
+        A dispatch that raised may have run, but the id is not necessarily ours: a live consumer
+        that took the row over (any status change clears ``claim_owner``) must keep its claim, or
+        the next replay of the same event would execute a turn that already started.
+        """
+        def _op(conn):
+            row = conn.execute(
+                "SELECT 1 FROM discord_messages WHERE message_id=? AND status='queued' "
+                "AND claim_owner=?",
+                (message_id, owner),
+            ).fetchone()
+            return row is not None
+        if self._with_discord_recovery_db(_op, default=False):
+            self._dedup.discard(message_id)
 
     def _record_discord_processing_start(self, event: MessageEvent, *, emoji_ack: bool) -> None:
         if not self._missed_message_backfill_enabled():
@@ -2847,7 +3152,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
 
         def _op(conn):
             conn.execute(
-                "UPDATE discord_messages SET status='processing', emoji_ack=?, updated_at=? WHERE message_id=?",
+                "UPDATE discord_messages SET status='processing', emoji_ack=?, updated_at=? "
+                "WHERE message_id=? AND status <> 'responded'",
                 (1 if emoji_ack else 0, now, message_id),
             )
         self._with_discord_recovery_db(_op)
@@ -2866,7 +3172,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             # cannot mark the row and backfill would re-dispatch it on every reconnect (#113631).
             def _complete(conn):
                 conn.execute(
-                    "UPDATE discord_messages SET status='responded', replied=1, updated_at=? WHERE message_id=?",
+                    "UPDATE discord_messages SET status='responded', replied=1, claim_owner=NULL, "
+                    "updated_at=? WHERE message_id=?",
                     (now, message_id),
                 )
             self._with_discord_recovery_db(_complete)
@@ -2877,7 +3184,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             conn.execute(
                 "UPDATE discord_messages "
                 "SET status=CASE WHEN status='responded' THEN status ELSE ? END, "
-                "updated_at=? WHERE message_id=?",
+                "claim_owner=NULL, updated_at=? WHERE message_id=?",
                 (status, now, message_id),
             )
         self._with_discord_recovery_db(_op)
@@ -2932,6 +3239,55 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             if channel_id:
                 self._advance_discord_recovery_cursor(channel_id, reply_to)
 
+    async def _discord_ledger_says_answered(self, message: Any) -> bool:
+        """True when the durable ledger proves this input was already answered (#39 N2).
+
+        Live ingress used to trust only the in-process TTL dedup, which a restart clears, so a
+        resumed session replaying MESSAGE_CREATE executed an answered input a second time. Only a
+        terminal *confirmed* answer blocks: ``processing`` may be a crashed turn's leftover and
+        must stay runnable, and an outage notice is not an answer. Any ledger fault fails OPEN to
+        the in-memory dedup — a broken ledger must never drop a user message.
+        """
+        if not self._missed_message_backfill_enabled():
+            return False
+        message_id = str(getattr(message, "id", "") or "")
+        if not message_id:
+            return False
+
+        def _op(conn):
+            row = conn.execute(
+                "SELECT status, replied, outage_response FROM discord_messages WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+            if not row:
+                return False
+            status, replied, outage = row
+            return status == "responded" and bool(replied) and not bool(outage)
+
+        try:
+            answered = await self._with_discord_recovery_db_async(_op, _LEDGER_UNREAD)
+        except Exception:
+            answered = _LEDGER_UNREAD
+        if answered is _LEDGER_UNREAD:
+            if not getattr(self, "_ledger_dedup_read_failed", False):
+                self._ledger_dedup_read_failed = True
+                logger.warning(
+                    "[%s] Discord recovery ledger unreadable; live ingress falls back to the "
+                    "in-memory dedup only",
+                    self.name, exc_info=True,
+                )
+            return False
+        # M1: clear the latch on a successful read so a fault that clears and returns is reported
+        # again (a once-per-process flag made a sustained or recurring outage silent forever).
+        self._ledger_dedup_read_failed = False
+        if answered:
+            logger.info(
+                "[%s] Dropping live Discord message %s: durable ledger already answered it "
+                "(status='responded', replied=1)",
+                self.name, message_id,
+            )
+        return bool(answered)
+
     def _discord_message_is_persistently_complete(self, message_id: str) -> bool:
         if not message_id:
             return False
@@ -2947,13 +3303,16 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
     def _discord_message_has_active_claim(self, message_id: str) -> bool:
         if not message_id:
             return False
-        cutoff = (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=10)).isoformat()
-
         def _op(conn):
             row = conn.execute(
-                "SELECT status, updated_at FROM discord_messages WHERE message_id=?", (message_id,),
+                "SELECT status FROM discord_messages WHERE message_id=?", (message_id,),
             ).fetchone()
-            return bool(row and row[0] in {"queued", "processing"} and row[1] >= cutoff)
+            if not row:
+                return False
+            # Fail closed: only a row that provably never reached a consumer may be retried.
+            # queued/processing/failed may already have run (side effects), cancelled/unknown are
+            # terminal, and a TTL is not evidence that a crashed turn did nothing.
+            return row[0] not in _DISCORD_RETRYABLE_STATUSES
         return bool(self._with_discord_recovery_db(_op, default=True))
 
     def _discord_message_attempts_exhausted(self, message_id: str) -> bool:
@@ -2985,13 +3344,14 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         self._with_discord_recovery_db(_op)
         return scan_id
 
-    def _record_recovery_scan_complete(self, scan_id: str, *, status: str, scanned: int, missed: int, dispatched: int, error: Optional[str] = None) -> None:
+    def _record_recovery_scan_complete(self, scan_id: str, *, status: str, scanned: int, missed: int, dispatched: int, pending_retry: int = 0, error: Optional[str] = None) -> None:
         now = self._utc_now_iso()
 
         def _op(conn):
             conn.execute(
-                "UPDATE discord_recovery_scans SET completed_at=?, status=?, scanned=?, missed=?, dispatched=?, error=? WHERE scan_id=?",
-                (now, status, scanned, missed, dispatched, error, scan_id),
+                "UPDATE discord_recovery_scans SET completed_at=?, status=?, scanned=?, missed=?, "
+                "dispatched=?, pending_retry=?, error=? WHERE scan_id=?",
+                (now, status, scanned, missed, dispatched, pending_retry, error, scan_id),
             )
         self._with_discord_recovery_db(_op)
 
@@ -6344,6 +6704,18 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
+        # Recovery counts a dispatch only on the base adapter's admission receipt: normalizing the
+        # message is not proof a consumer took it (no handler / dedup / session guard all drop it),
+        # and counting those as dispatched hides the message from the next scan.
+        if recovered:
+            # Three-way outcome the recovery scan needs: consumed (accepted), provably refused
+            # before any consumer, or UNKNOWN (neither stamp) — see #39 N3. Recorded on the adapter
+            # (not on the message: discord.Message is __slots__) and read once by the recoverer.
+            self._record_recovery_receipt(message.id, {
+                "accepted": bool(getattr(event, "_gateway_accepted", False)),
+                "refused": bool(getattr(event, "_gateway_refused", False)),
+            })
+            return bool(getattr(event, "_gateway_accepted", False))
         return True
 
     def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
